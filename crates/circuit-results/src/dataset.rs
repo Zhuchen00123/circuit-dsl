@@ -477,6 +477,15 @@ pub struct Dataset {
     pub kind: String,
     pub axis: Axis,
     pub signals: Vec<Signal>,
+    /// Signals that exist only because a result expression reads them, and
+    /// that the analysis did not otherwise report.
+    ///
+    /// They must stay in [`Dataset::signals`] so measures and derived signals
+    /// can be evaluated, but they are **not** part of what the user asked to
+    /// see: the output view drops them unless the experiment also named them
+    /// in a `save`. Empty for a dataset nothing extra was read for, and for
+    /// every dataset built by hand or by a test.
+    pub implicit_only: Vec<String>,
     /// Diagnostics that belong to this result: backend warnings, export
     /// warnings. Errors normally stop the run before a dataset exists.
     pub diagnostics: Vec<Diagnostic>,
@@ -504,6 +513,7 @@ impl Dataset {
             kind: kind.into(),
             axis,
             signals,
+            implicit_only: Vec::new(),
             diagnostics: Vec::new(),
             backend,
         };

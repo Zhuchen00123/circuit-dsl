@@ -231,6 +231,21 @@ mod tests {
         assert_complete("1 + 1");
     }
 
+    /// A result-expression statement is an experiment statement like any
+    /// other: an open block that contains one is a continuation, not an
+    /// error, so the prompt must keep waiting for the `end`.
+    #[test]
+    fn an_experiment_with_a_derive_still_continues() {
+        assert_incomplete(
+            "experiment :e, circuit: :x do\n  derive :g, expr: v(:a) / v(:b)\n",
+            "unclosed `do` block",
+        );
+        assert_incomplete(
+            "experiment :e, circuit: :x do\n  measure :m, max: v(:a), analysis: :ac1\n",
+            "unclosed `do` block",
+        );
+    }
+
     #[test]
     fn an_unclosed_block_continues() {
         assert_incomplete("circuit :d do\n", "unclosed `do` block");

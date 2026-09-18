@@ -26,7 +26,7 @@ ident := [A-Za-z_][A-Za-z0-9_]*
 circuit  subcircuit  experiment  param  node  instance  model
 do  end  else  elsif  if  for  in
 true  false
-op  dc  ac  tran  save  measure
+op  dc  ac  tran  save  measure  derive
 resistor  capacitor  inductor  voltage_source  current_source  diode
 pulse  sin  pwl
 from  to  step  points  points_per_decade  default  value  of  ports  params
@@ -185,6 +185,11 @@ true          false
 
 - `+` `-`：两侧量纲必须相同，否则 `E_DIMENSION`。
 - `*` `/`：量纲指数相加/相减，结果量纲自动推导。
+- **量纲指数溢出是诊断，不是 panic 也不是回绕**：`*` `/` 走受检算术，指数是 `i8`，
+  可表示范围 `-128..=127`；越界报 `E_DIMENSION`，消息给出两个操作数的量纲与
+  `an exponent is held as a signed 8-bit integer, -128..=127` 的范围提示。
+  128 个 `v(:vin)` 相乘这类链在 debug 与 release 都是同一条诊断（实测 `cdsl check` exit 1，
+  无 panic、无回绕）。
 - 比较 `<` `<=` `>` `>=` `==` `!=`：两侧量纲必须相同。
 - 需要无量纲的地方（如 `points`）**不接受**带量纲值，报 `E_DIMENSION`。
 - 非有限值（`inf`、`NaN`）在展开期报 `E_VALUE`。
@@ -200,8 +205,8 @@ true          false
 | `pulse(low:, high:, delay:, rise:, fall:, width:, period:)` | 脉冲波形 |
 | `sin(offset:, amplitude:, frequency:, delay:, damping:, phase:)` | 正弦波形 |
 | `pwl([t0, v0, t1, v1, ...])` | 分段线性波形 |
-| `v(:node)` / `v(:a, :b)` | 电压探针（仅 `save`）；名字可以是层次路径或字符串，见 §5.2 |
-| `i(:device)` | 电流探针（仅 `save`）；同上 |
+| `v(:node)` / `v(:a, :b)` | 电压探针：用于 `save` 与结果表达式（§7.2），不能在电路 body 的表达式里取值；名字可以是层次路径或字符串，见 §5.2 |
+| `i(:device)` | 电流探针：同上 |
 | `abs(x)` `sqrt(x)` `min(a,b)` `max(a,b)` | 数值函数 |
 
 ## 3. 程序结构
@@ -250,11 +255,44 @@ if <条件> do <语句> [else <语句>] end
 
 ### 4.2 参数
 
-- `param` 只能在 body 内声明，可引用**之前**声明的参数。
-- 默认值 `default:` 可省略；省略时必须由实例或实验提供覆盖。
-- 参数**按声明顺序**求值，只能引用在它**之前**声明的参数。因此依赖关系必然是有向无环的：环在结构上无法形成。引用尚未声明的参数（包括自引用、前向引用）报 `E_NAME`。`E_PARAM_CYCLE` 在错误码表中保留，但当前没有任何代码路径会产生它。
-- 覆盖顺序：**默认值 → 实例或实验覆盖 → 扫描点覆盖**。
-- 影响条件、循环次数或连线的参数是**拓扑参数**；扫描拓扑参数报 `E_TOPO_PARAM`。
+- `param` 只能在 body 内声明；默认值 `default:` 可省略，省略时必须由实例或实验提供覆盖。
+- **同一 body 内前向引用合法**：一个 body 的 `param` 声明先被整体收集，再按依赖顺序
+  （拓扑序）求值；书写顺序只用来打破平局，因此同一个输入永远展开成同一个结果。
+  下面 `param :b, default: 2 * a` 写在 `param :a` 之前仍然合法——实测 `cdsl check` exit 0、
+  `cdsl run` 给出 `v(out) = 4 V`（`a = 1 kΩ`、`b = 2 kΩ`、6 V 分压）：
+
+  ```ruby
+  circuit :chain do
+    param :b, default: 2 * a     # 前向引用：a 在本 body 稍后声明
+    param :a, default: 1.kohm
+    node :in, :out
+    voltage_source :v1, p: :in, n: :gnd, dc: 6.V
+    resistor :r1, p: :in, n: :out, value: 1.kohm
+    resistor :r2, p: :out, n: :gnd, value: b
+  end
+
+  experiment :div, circuit: :chain do
+    op
+    save v(:out)
+  end
+  ```
+
+- **环是 `E_PARAM_CYCLE`，不是 `E_NAME`**：自引用（`param :a, default: a`）与多节点环
+  （`param :a, default: b` + `param :b, default: a`）都报 `E_PARAM_CYCLE`，消息给出闭合路径
+  （`a -> a`、`a -> b -> a`），主标签落在闭合处，每个参与声明的 `param` 行各带一个次标签。
+  引用一个根本没有声明的名字仍是 `E_NAME`（"not declared"），两者不会混。
+- 依赖边只存在于**同一个 body**：子电路的默认值看不到父作用域；唯一跨作用域的通道是实例的
+  `params: { .. }`（值在父作用域求值，成为实例内同名参数的有效定义）。因此不同实例里的同名
+  参数是两个独立节点，扫描顶层的 `r` 不会牵连同名的子实例参数，除非 `params:` 真的连上它们。
+- 覆盖顺序（后者覆盖前者）：**默认值 → 实例 `params:` → 实验 `param:` → 扫描点 →
+  REPL 的 `:run name=expr`**。被覆盖的参数**不会求值它的 `default:`**，默认表达式也不产生
+  依赖边。注意 `cdsl check` 会把每个顶层电路按它**自己的默认值**单独展开一遍（电路是可复用
+  单元），所以只有实验覆盖、而默认值本身写错的电路仍会在 `check` 阶段被判定：覆盖保护的是
+  真正用到它的那次展开，不是让 `check` 放弃判定。
+- 影响条件、循环次数或生成名称的参数是**拓扑参数**：扫描它（`dc param:`）在
+  `cdsl check` / `cdsl run` / REPL 的 `:load` 阶段就报 `E_TOPO_PARAM`，诊断给出
+  "被扫描参数 → 中间参数 → 使用点" 的解释路径（§5.1）。只出现在数值位置的参数
+  （`value:`、`dc:`、`ac:`、`waveform:`、模型参数）仍然可以扫描。
 - `param` 只能出现在 **circuit / subcircuit body 的顶层**（以及 experiment body 顶层的
   `param :r, value: ...` 覆盖）。写在 `for` / `if` 块内报 `E_UNSUPPORTED` 并说明改法——
   参数是设计的一部分，不是控制流里的临时量；需要在分支里取不同值就把条件写进
@@ -311,7 +349,8 @@ experiment :name, circuit: :电路名 do
   <分析语句>
   save <探针列表>
   param :r, value: 2.kohm      # 实验级参数覆盖
-  measure :name, <测量>        # 见 §7
+  derive  :name, expr: <结果表达式>              # 见 §7.3
+  measure :name, <max|min|avg|rms>: <结果表达式>  # 见 §7.1、§7.4
 end
 ```
 
@@ -329,11 +368,21 @@ tran stop: 1.ms, max_step: 10.ns, output_interval: 1.us
 ```
 
 一个实验可声明**多个**分析。同种分析按出现顺序编号：两个 `ac` 分别是 `ac1` 与
-`ac2`，导出文件也据此区分，不会互相覆盖。
+`ac2`，导出文件也据此区分，不会互相覆盖。这个 `{种类}{序号}`（序号从 1 起、按种类分别计数、
+按声明顺序）就是**分析标识**：它既是结果数据集与导出文件的名字，也是 `derive` / `measure`
+的 `analysis:` 写的那个名字（§7.4）。
 
 **DC**：`source:` 与 `param:` 二选一。要求 `step` 非零、方向与
 `from`/`to` 一致、点数不超过上限。`to` 不落在步长整数倍上时，
 最后一点**不超过** `to`。
+
+`dc param: :r` 的 `:r` 必须在**展开阶段**就能被证明与拓扑无关：如果它能（直接、或者经由
+中间参数与实例 `params:` 绑定）到达 `if` 条件、`for` 的迭代源、或一个生成名称/端子，
+`cdsl check`、`cdsl run` 与 REPL 的 `:load` 都会报 `E_TOPO_PARAM`，诊断给出
+`被扫描参数 -> 中间参数 -> 拓扑使用点` 的路径与每一步的 span（§4.2；实测见
+`docs/review-evidence/round4/qa-acceptance-phase-b.md` §3.5）。只出现在数值位置的参数
+（`value:`、`dc:`、`ac:`、`waveform:`、模型参数）不受影响，普通元件数值扫描照常可用；
+每个扫描点的**运行期**拓扑比较仍然保留，作为第二道防线。
 
 **AC**：频率必须为正且 `to > from`。`points_per_decade` 与 `points`
 二选一。相位以弧度内部存储，输入输出用度。
@@ -407,7 +456,8 @@ save v(:vin), v(:vout), v(:a, :b), i(:input)
 1. **改 `output_interval` 不改变激励波形与物理解**：它不进入求解器，不影响 PULSE 的
    `rise`/`fall`，也不会延长或缩短仿真窗口。
 2. **改 `output_interval` 不改变测量**：`avg`/`rms`/`max`/`min` 一律在**原始求解网格**上计算
-   （§7）；重采样只改变展示与导出的采样点。
+   （§7）；重采样只改变展示与导出的采样点。派生信号（`derive`）同样先在原始网格上求值，
+   再随输出视图重采样（§7.6），因此 `v*v` 这类非线性结果不会被「先插值再求值」改变。
 3. **文件模式与 REPL 一致**：两者共用同一条执行路径，导出与摘要都用输出网格。结果元数据里
    两种数据可区分——`cdsl run --format json` 的 `backend.settings` 记录
    `tran.solver_step`、`tran.solve_points`、`tran.waveform_bound`、`tran.max_step`，以及
@@ -445,9 +495,14 @@ cdsl --version
   的语法不受影响。完整说明见 `docs/repl.md`。
 - 管道输入时（stdin 不是终端）REPL 逐行读取、不启用行编辑，有输入报错则以 1 退出，
   因此一段会话可以写进脚本或测试。
-- CSV 的复数列拆成 `_re` / `_im` 两列。
-- JSON 保留单位、轴类型与后端元数据。
-- 非有限值导出为 `null`（JSON）与空字段（CSV），并给出警告。
+- CSV 的复数列拆成 `_re` / `_im` 两列；派生信号（`derive`，§7.3）与 `save` 的信号在同一张表里，按信号名出列。
+- JSON 保留单位、轴类型与后端元数据；派生信号作为普通信号出现（带自己的单位与实数/复数类型），并在 `backend.settings` 里记下 `derive.<名字> = <表达式的规范形式>`（见 §7.2 末），便于复现（§7.3）。
+- 测量值打印时带上它取自哪个分析：`measure peak_gain = 0.998031904503645 dimensionless (ac1)`（§7.4）。
+- 非有限值导出为 `null`（JSON）与空字段（CSV），并在渲染时给出警告；`cdsl run` 与
+  REPL 都会把警告打印出来（`warning[E_VALUE]: signal \`v(x)\` has 1 non-finite sample(s)`）。
+  **两种诊断互补、不是同一批**：`<file>.json` 里的 `diagnostics` 数组是数据集自己的来源
+  诊断（计划层与后端附上的），渲染期警告（每个非有限样本一条）只由 CLI/REPL 打印，文件本身
+  只表现为空字段或 `null`。同一个数据集同时写 CSV+JSON 时，警告按数据集去重一次。
 
 结果中的单位与轴：
 
@@ -458,7 +513,9 @@ cdsl --version
 | AC | 频率 Hz（对数或线性） | 复数 |
 | TRAN | 时间 s（非均匀；给了 `output_interval` 则是等间隔网格，末点保留） | 实数 |
 
-## 7. 测量
+## 7. 测量与结果表达式
+
+### 7.1 直接探针形式（原有形式，保持不变）
 
 ```ruby
 measure :vmax, max: v(:out)
@@ -471,10 +528,228 @@ measure :vrms, rms: v(:out)
   - `avg = ∫x dt / ∫dt`
   - `rms = sqrt(∫x² dt / ∫dt)`
 - `max` / `min` 取样本极值。
-- 对没有时间轴的分析使用 `avg`/`rms` 报 `E_TYPE`。
+- 对没有时间轴的分析使用 `avg`/`rms` 报 `E_TYPE`（这种 legacy 形式没有绑定，所以在**运行期**报告，见 §7.7）。
 - **一个实验可以声明多个分析**，同一探针可能同时存在于多个结果里。测量的选取规则是：
   取**能支持该测量的最丰富分析**，优先级依次为 `tran` > `ac` > `dc` > `op`。
   否则 `max: v(:out)` 会取到工作点的 0 V 而不是瞬态峰值。
+
+### 7.2 结果表达式
+
+`derive` 的 `expr:` 与 `measure` 的归约目标都接受**结果表达式**：它按采样点求值，
+产生的序列与探针信号等长。
+
+| 形式 | 含义 |
+|---|---|
+| `v(:node)`、`v(:a, :b)`、`i(:device)` | 探针读取；解析规则与 `save` 完全相同（§5.2），`v(:a, :b)` 是 `Va - Vb`，`i(:dev)` 的正方向是 `p → n` |
+| 无量纲数字字面量（`1`、`2.5`） | 广播到每个采样点的标量 |
+| `( )`、一元 `+` / `-`、`+` `-` `*` `/` | 算术；量纲按 §2.4 传播，两侧混合实数/复数时提升为复数 |
+| `abs(x)` | 绝对值（对复数是模长），保留单位 |
+| `sqrt(x)` | 平方根；要求每个量纲指数都是偶数，且数据是实数 |
+| `min(a, b)`、`max(a, b)` | **逐采样点**的极值（不是 §7.1 的归约） |
+| `gain_db(a, b)` | `20*log10(abs(a/b))`；两侧量纲必须相同，结果无量纲 |
+
+**每个运算节点都校验自己产出的样本**（结果表达式与 `cdsl check` 的常量求值共用同一条实现）：
+实数要求 `is_finite()`，复数要求实部与虚部都有限；`sqrt` 的负实数样本、分母恰好为 0、
+`gain_db` 比值为零都是确定性错误。所以 `min(sqrt(-1), 2)` 在 `sqrt` 处失败、不能被外层的
+`min`/`max` 掩盖；`1e308 * 1e308` 是 `E_VALUE`，不会让 `inf` 继续参与计算。**没有 epsilon
+救场、没有饱和、没有跳过样本**：非法样本报诊断，而不是变成一个看起来合理的有限数。输入本身
+非有限（信号里已经是 NaN/±inf）同样被读取它的运算拒绝。乘法/除法的量纲走受检算术，指数越界
+报 `E_DIMENSION`（§2.4）。
+
+按设计拒绝、报 `E_TYPE` 而不会被静默忽略的写法：比较（`<`、`==` 等）与布尔运算
+（`&&`、`||`、`!`）、数组、字典、`true`/`false`、字符串、裸符号、带量纲的字面量
+（`1.V`——这里的字面量只能是纯数）、裸标识符（`r1` 是参数，不是信号）。
+函数名与信号名是两个命名空间：`min` 只可能是函数。
+
+这就是一个完整可运行的文件：
+
+```ruby
+circuit :rc do
+  param :r, default: 1.kohm
+  param :c, default: 100.nF
+  node :vin, :vout
+  voltage_source :input, p: :vin, n: :gnd, dc: 0.V, ac: 1.V
+  resistor :r1, p: :vin, n: :vout, value: r
+  capacitor :c1, p: :vout, n: :gnd, value: c
+end
+
+experiment :response, circuit: :rc do
+  ac from: 100.Hz, to: 100.kHz, points_per_decade: 40
+
+  derive :gain,    expr: v(:vout) / v(:vin)
+  derive :gain_db, expr: gain_db(v(:vout), v(:vin))
+  measure :peak_gain, max: abs(v(:vout) / v(:vin))
+end
+```
+
+`cdsl run <file> --experiment response --out <dir>` 的实测输出：
+
+```text
+experiment `response` on circuit `rc` (backend thevenin 0.5.0)
+  ac1: 121 frequency points; signals: v(vin), v(vout), i(input), gain, gain_db
+  measure peak_gain = 0.998031904503645 dimensionless (ac1)
+  wrote <dir>\response.ac1.csv
+  wrote <dir>\response.ac1.json
+```
+
+后面几节沿用这个 `circuit :rc`，只写实验部分。
+
+**表达式的"规范形式"**：诊断、`cdsl check` 的语句回显与 JSON 的 `backend.settings` 打印的是
+表达式**规范形式**（`ExprIr::render`），不是逐字源文本——展开期只有 span、没有源文本，
+规范形式无歧义。因此 `v(:vout) / v(:vin)` 会印成 `(v(vout) / v(vin))`，
+`gain_db(v(:vout), v(:vin))` 会印成 `gain_db(v(vout), v(vin))`，可能多出括号。
+不要依赖它逐字回显你写下的字符。
+
+### 7.3 `derive`：派生信号
+
+```ruby
+derive :gain,    expr: v(:vout) / v(:vin)
+derive :gain_db, expr: gain_db(v(:vout), v(:vin)), analysis: :ac1
+```
+
+- `derive` 只出现在 experiment body 里；名字必须**字面书写**（不能是拼接表达式）。
+- 派生信号是该分析结果里的一列：在**原始求解网格**上求值（§7.6），追加到该分析的数据集与输出
+  视图，CSV/JSON 里与 `save` 的信号一样导出；单位由表达式推导（`v/v` 无量纲、`v*i` 是功率）。
+- 派生名是一个**新标识符**，而 `save` / 表达式导出的信号名永远带探针形式（`v(vin)`、`v(a,b)`、
+  `i(r1)`），语法又不允许把 name 写成探针形式，所以两者**不可能**撞名：`save v(:vin)` 与
+  `derive :vin, expr: v(:vin) * 2` 合法，产出 `v(vin)` 与 `vin` 两列（实测）。
+  检查阶段真正会报 `E_DUPLICATE` 的是其它 `derive` / `measure` 用了同一个名字
+  （实测：`derive :m` 之后再写 `measure :m, ...`，诊断指向先定义的那一条）。
+  运行期还有一道兜底：派生名与后端**实际返回**的信号同名时报 `E_DUPLICATE`
+  （`circuit-session::execute::attach_derived`）。
+- 派生信号不是新探针，也不改变导出集合：它只增加读取依赖（§7.5）。
+- `derive` 不能引用另一个 `derive`，见 §7.8。
+
+### 7.4 分析标识与 `analysis:` 绑定
+
+分析标识是 `{种类}{序号}`：序号从 1 起、按种类分别计数、按声明顺序。若实验先写 `op` 再写 `ac`，
+标识就是 `op1` 与 `ac1`；两个 `ac` 是 `ac1`/`ac2`（§5.1）。同一个标识既是结果数据集的名字
+与导出文件名（`response.ac1.csv`），也是 `analysis: :ac1` 里的名字。
+
+`derive` 与 `measure` 用语句末尾的 `analysis: :<id>` 指定在哪个分析上求值：
+
+1. 写了 `analysis:`：必须命名**这个实验**里存在的分析，否则报 `E_NAME` 并列出可用标识。
+   `:ac` 不带序号不是合法标识。
+2. 实验里只有**一个**分析、又没写 `analysis:`：绑定到它。
+3. 实验里有**多个**分析、又没写 `analysis:`：报 `E_AMBIGUOUS`，不会去猜哪个分析恰好能算。
+
+唯一的例外是 §7.1 的历史形式：`measure` 的目标是**单个裸探针**且没写 `analysis:` 时，
+保留原来的 tran > ac > dc > op 选取顺序。目标一旦写成表达式（哪怕只是 `abs(v(:out))`），
+就必须按上面三条绑定。
+
+```ruby
+experiment :two, circuit: :rc do
+  ac from: 100.Hz, to: 100.kHz, points_per_decade: 40
+  op
+  derive :g, expr: v(:vout) / v(:vin), analysis: :ac1
+  measure :gm, max: abs(v(:vout) / v(:vin)), analysis: :ac1
+end
+```
+
+实测：这个实验里 `g` 只出现在 `ac1`（`signals: v(vin), v(vout), i(input), g`），`op1` 没有它；
+测量打印为 `measure gm = 0.998031904503645 dimensionless (ac1)`。把 `analysis:` 换成不存在的 `:ac2`
+会报 `E_NAME` 并列出 `available analyses: ac1`。
+
+参数扫描实验只会产生一个拼接后的数据集（见 `docs/architecture.md` §7），因此把 `derive`/`measure`
+绑到非扫描分析是**运行前**的能力错误（`E_UNSUPPORTED`），而不是静默丢弃。
+
+### 7.5 探针依赖：不需要 `save`
+
+结果表达式读到的探针会**自动**加入该分析的读取集合：不写 `save` 也能求值，后端不必先把它们导出。
+
+- 显式 `save` 仍然决定**导出**哪些信号；隐式依赖只被读取，不是导出列。
+- 没写 `save` 时导出的是**后端自己报告的**全部信号；表达式依赖里那些后端本来不报告的信号
+  （例如差分 `v(:a, :b)` 或按欧姆定律推导的 `i(:r1)`）只参与求值，**不会**作为新列出现，
+  所以「加一个测量」既不会让已有列消失，也不会平白多出没人写过的列。数据集的 `implicit_only`
+  记录了这批仅供求值的信号名，输出视图据此过滤。
+- `cdsl check` 会把这些依赖打印成 `reads v(:vout) (expression inputs, not exported)`；
+  机器可读的 `check --json` 里是每个分析的 `implicit_probes` 字段。
+
+```ruby
+experiment :gain_only, circuit: :rc do
+  ac from: 100.Hz, to: 100.kHz, points_per_decade: 40
+  save v(:vin)                              # 只导出 vin
+  derive :gain, expr: v(:vout) / v(:vin)    # 用到了没保存的 v(:vout)
+end
+```
+
+这个实验可以跑：导出的表是 `v(vin)` 加 `gain` 两列，`v(vout)` 只被读取、不出列。
+
+### 7.6 执行顺序
+
+```text
+elaborate + 静态检查
+  -> 每个分析的读取集合 = save 探针（或后端默认）+ 隐式依赖
+  -> 后端求解（原始求解网格；output_interval 不进入求解器）
+  -> 在原始数据集上求值 derive 表达式（非线性值先算）
+  -> 在原始数据集上求值 measure（粗输出采样移动不了测量值）
+  -> 组装输出视图 = 导出信号 + 派生信号
+  -> 重采样输出视图（对已算好的派生数据做线性插值）
+  -> CLI/REPL 显示、CSV/JSON 导出
+```
+
+- `output_interval:` 只作用于最后的重采样那一步，永远不进入求解器（§5.3）。
+- 顺序是刻意的：`avg`/`rms`/`max`/`min` 与派生信号都在原始求解网格上计算，重采样只改变展示
+  与导出的采样点，非线性表达式（如 `v*v`）不会被先插值再求值。
+- 表达式或测量求值失败发生在任何文件写出之前：`cdsl run` 以非零退出码（`EXIT_USER_ERROR` = 1）
+  结束，不留半份导出（§7.7）。
+
+### 7.7 错误契约
+
+| 情况 | 阶段 | 错误码 |
+|---|---|---|
+| 未知探针 / 未知节点或器件 | 检查（展开） | `E_NAME` |
+| 结果表达式里的未知函数 | 检查 | `E_NAME`（列出可用函数） |
+| 带量纲字面量、裸标识符、比较/布尔、数组、字典、符号、字符串 | 检查 | `E_TYPE` |
+| `+` / `-` / `min` / `max` 两侧静态量纲不同 | 检查 | `E_DIMENSION` |
+| `gain_db` 分子与分母的静态量纲不同 | 检查 | `E_DIMENSION` |
+| `sqrt` 的量纲指数非全偶 | 检查 | `E_DIMENSION` |
+| 未知的 `analysis: :id` | 检查 | `E_NAME`（列出可用标识） |
+| 多分析实验里没写 `analysis:` | 检查 | `E_AMBIGUOUS` |
+| 重名 `derive`，或 `derive` 与 `measure` 撞名 | 检查 | `E_DUPLICATE` |
+| `avg`/`rms` 绑定（写了 `analysis:` 或目标是表达式）到一个没有时间轴的分析 | 检查 | `E_TYPE`，提示绑到 `tran` |
+| `max`/`min` 绑到 AC 且表达式可能为复数 | 检查 | `E_TYPE`，提示 `abs(...)` |
+| `max`/`min` 运行期遇到复数（legacy 路径选中的分析） | 运行期 | `E_TYPE`，提示 `apply abs(...)` |
+| 除零样本（表达式读信号时） | 运行期 | `E_VALUE`，含分析、信号与样本坐标 |
+| `gain_db` 的零幅度样本（表达式读信号时） | 运行期 | `E_VALUE`，同上 |
+| 绑定的分析求值失败 | 运行期 | 失败原样传播（请求过的测量不会静默消失） |
+| `avg`/`rms` 在所有候选分析里都没有时间轴 | 运行期 | `E_TYPE`，列出试过哪些分析 |
+| 参数扫描实验里绑定了非扫描分析 | 运行前能力检查 | `E_UNSUPPORTED` |
+| 常量非法值：`sqrt(-1)`、`1e308*1e308`、`x/0`、`gain_db(0, x)` | 检查（`cdsl check` 求值常量表达式） | `E_VALUE`，与运行期同一文本 |
+| 任何运算产出非有限样本（实 `is_finite`、复数两个分量） | 运行期（常量表达式在检查期就被拒绝） | `E_VALUE`，命名运算与子表达式 |
+| 输入样本本身是 NaN/±inf | 运行期 | `E_VALUE`，由读取它的运算报出 |
+| 量纲指数越出 `i8` 范围（长乘积/除法链） | 检查（静态量纲）或运行期 | `E_DIMENSION`，消息含 `signed 8-bit integer, -128..=127` |
+| 表达式深度/形态超过 256 层 | 检查（解析） | `E_LIMIT`，给出观测深度与上限 |
+| 参数自引用或多节点环 | 检查（展开） | `E_PARAM_CYCLE`，闭合路径 + 每个参与声明的 span |
+| 扫描一个拓扑参数 | 检查/运行前（`check`、`run`、REPL `:load`） | `E_TOPO_PARAM`，解释路径 |
+
+**常量表达式在 `cdsl check` 阶段就被拒绝**：`derive` 与表达式形式的 `measure` 如果不读任何
+信号（内部判定是 `is_constant`），`cdsl check` 会用与运行期同一个求值器算出它的值，失败即
+exit 1；错误文本与运行期相同，只是没有分析/样本上下文，改为附上 `derive:`/`measure:` 名。
+读信号的表达式只做静态量纲检查，只能在 `run` 阶段失败（实测：同一个 `sqrt(-1)` 常量表达式
+在 `check` 与 `run` 都 exit 1；`check` 文本带 `= derive: illegal`，`run` 文本还带
+`= analysis: op1`、`= sample: sample 0`、`= index: 0`）。REPL 在定义实验时不求值常量表达式，
+`:run` 时给出同一条诊断（§4.5 之外，见 `docs/repl.md`）。
+
+没有 epsilon 救场：非法值就是诊断，不会变成一个看起来合理的有限数。诊断带定位信息——
+表达式失败带 `= analysis:`、`= kind:`、`= signal:`、`= sample:`、`= index:` 与
+`= expression:`（表达式的规范形式），具名的 `derive`/`measure` 还把名字写进消息首行并替换
+`signal`；测量失败带 `= measure:`。样本坐标是轴上的真实坐标（`= sample: time = 2e-3`、
+`= sample: frequency = 1000`）；**标量分析（OP 与 DC 单点）没有轴**，此时诊断说明"这是单个
+标量样本，按 index 命名"，常量表达式则说明"没有数据集也没有分析轴"。
+
+### 7.8 当前限制
+
+- **`derive` 不能喂给另一个 `derive`**（也不能被 `measure` 引用）：结果表达式只接受探针读取，
+  裸标识符报 `E_TYPE` 并提示派生信号在这一版不可这样引用。
+- **一个表达式的所有样本来自同一个分析与同一个轴**：没有跨分析、跨轴取样或对齐；
+  要比较两个分析的值，请分别写两条语句。
+- **复数没有隐式排序**：`max`/`min` 作用于可能是复数的 AC 数据（或 legacy 路径选中的分析）报
+  `E_TYPE`，必须显式写 `abs(...)`；`abs` 与 `gain_db` 本身对复数有定义（取模长）。
+- 结果表达式里没有比较、布尔、条件、数组、字典、带量纲字面量与自定义函数；
+  `sqrt` 只对实数、且量纲指数全偶时成立。
+- **表达式深度上限 256 层**（§9）：更深的表达式报 `E_LIMIT`；因为 `derive` 之间不能互相
+  引用，长链需要拆成多条语句或改写为参数/子电路里的表达式。
 
 ## 8. 诊断
 
@@ -513,6 +788,15 @@ error[E_DIMENSION]: resistor.value 需要电阻量纲，实际为时间
 - 内部数值统一为 SI 基本单位。
 - 普通 R/L/C 要求**严格正值**；零值与负值报 `E_VALUE`，
   不会替换成很小的正数。
+- **表达式深度上限 256**（`circuit_core::limits::MAX_EXPR_DEPTH`）：解析器按嵌套深度与
+  AST 形态两个角度设限，求值器再核对一次；超过上限报 `E_LIMIT`（`expression is N levels
+  deep, which is deeper than the 256 level limit` / `expression nests deeper than 256 levels`），
+  不会耗尽栈把进程杀掉。上限与栈是配对的：`cdsl` 的每个子命令都在 **64 MiB 栈**的线程上
+  运行（`crates/circuit-cli/src/main.rs`），所以被接受的深度在未优化的 debug 构建里也能处理；
+  把本项目的 crate 嵌入到小栈调用方时需要自己提供同样的栈。128 个 `v(:vin)` 的乘积仍然在
+  求值前由静态量纲检查拦下，报 `E_DIMENSION` 而不是 `E_LIMIT`。
+- **量纲算术是受检的**：`*` `/` 的指数越界是 `E_DIMENSION` 诊断（§2.4），debug 不 panic、
+  release 不回绕。
 - 瞬态选项必须显式合法：`max_step` / `output_interval` 为 0、负数或非有限报 `E_VALUE`，
   **不回退默认值**；`output_interval` 只影响输出采样（§5.3），不进入求解器。
 - 声明的源边沿必须可执行：`rise`/`fall`/`period` 为 0 或非有限报 `E_UNSUPPORTED`；
@@ -530,9 +814,12 @@ error[E_DIMENSION]: resistor.value 需要电阻量纲，实际为时间
 - MOSFET、BJT、受控源、行为源、开关、互感。
 - SPICE 网表导入/导出。
 - 噪声、灵敏度、Monte Carlo、优化、参数拟合。
-- 多参数联合扫描（仅单参数）。
+- 多参数联合扫描（仅单参数）：一个实验里写两个 `dc param:` 会在 `check` 阶段被拒绝（`E_UNSUPPORTED`），因为一次运行只能驱动一个扫描；请拆成两个实验。
 - `while`、递归、用户自定义函数。
-- 复数的完整结果表达式（如任意传递函数表达式）。
+- 结果表达式以外的能力：比较/布尔/条件、数组、字典、带量纲字面量、自定义函数，
+  以及 `derive` 之间互相引用（§7.8）。复数只支持 §7.2 列出的运算（四则运算、`abs`、`gain_db`），
+  没有任意的传递函数表达式。
+- 跨分析/跨轴的结果表达式：一个表达式只在一个分析上求值，也不会把两个分析的样本拼在一起（§7.8）。
 - `include` 与外部模型文件。
 - REPL 的语法高亮、多行编辑、`:save` 回写文件、跨会话持久化（历史文件除外）。
 - 文件模式下的赋值：`name = value` 只属于 REPL，文件里用 `param`。

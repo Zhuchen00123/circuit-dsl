@@ -10,6 +10,7 @@ use std::path::Path;
 use circuit_backend::thevenin::TheveninBackend;
 use circuit_core::diagnostic::{Code, Diagnostic, Diagnostics};
 use circuit_results::dataset::Dataset;
+use circuit_session::execute::Written;
 use circuit_session::{Format, RunRequest, write_datasets};
 
 use crate::{EXIT_USER_ERROR, Format as CliFormat, check, guard_output};
@@ -144,7 +145,7 @@ fn print_summary(
     outcome: &circuit_session::RunOutcome,
     plan: &circuit_core::plan::AnalysisPlan,
     overrides: &[String],
-    written: &[std::path::PathBuf],
+    written: &Written,
 ) {
     let first: &Dataset = &outcome.datasets[0];
     println!(
@@ -160,10 +161,20 @@ fn print_summary(
     for w in &outcome.warnings {
         eprintln!("  warning: {w}");
     }
-    for m in &outcome.measures {
-        println!("  measure {}", m.render());
+    // The warnings the renderer raised for the files just written (a non-finite
+    // sample is an empty cell, not a number). They are printed in the same
+    // shape as the run's own warnings, and `warning_lines` is shared with the
+    // REPL so both front ends say the same thing about the same dataset.
+    for line in written.warning_lines() {
+        eprintln!("{line}");
     }
-    for path in written {
+    for m in &outcome.measures {
+        // The analysis identity is part of the value: the `max` of a transient
+        // and the `max` of an AC sweep are different numbers even under one
+        // name, so the name alone would not say what was measured.
+        println!("  measure {}", m.render_with_analysis());
+    }
+    for path in &written.paths {
         println!("  wrote {}", path.display());
     }
 }

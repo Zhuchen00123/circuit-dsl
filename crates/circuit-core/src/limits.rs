@@ -26,6 +26,29 @@ pub struct Limits {
     pub max_pwl_points: usize,
 }
 
+/// Maximum nesting depth of a written expression.
+///
+/// Both the parser and the result-expression evaluator are recursive, so this
+/// is where recursion stops: input deeper than this is refused with
+/// `E_LIMIT` naming the observed depth, instead of running the stack out and
+/// killing the process with no diagnostic (round-4 FINDING-1).
+///
+/// It is a `const` and not a `Limits` field on purpose: the depth is enforced
+/// in the parser and in `circuit-results`, neither of which carries a
+/// `Limits` value, and both sides must agree on one number.
+///
+/// 256 is far above anything written by hand (real programs nest a handful of
+/// levels) and far below what a 64 MiB stack — the stack `cdsl` runs its work
+/// on — can hold even in an unoptimised build: measured in a debug build, 300
+/// nested calls abort on a 2 MiB thread but are a clean `E_LIMIT` on the
+/// work stack, and every depth up to the limit is accepted there.
+///
+/// The pairing matters: the limit is what makes deep input a *diagnostic*, and
+/// the work stack is what makes the accepted depth *processable*. A caller
+/// embedding these crates on a small stack should give the work the same kind
+/// of stack; `cdsl` does it in `main`.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
 impl Default for Limits {
     fn default() -> Self {
         Self {

@@ -47,6 +47,9 @@ pub enum Code {
     Name,
     /// Duplicate definition of a name in the same namespace.
     Duplicate,
+    /// A result expression could belong to more than one analysis and no
+    /// binding was written.
+    Ambiguous,
     /// Dimensional mismatch in an expression or device parameter.
     Dimension,
     /// A device/parameter value is outside its contract (for example R <= 0).
@@ -85,6 +88,7 @@ impl Code {
             Code::Syntax => "E_SYNTAX",
             Code::Name => "E_NAME",
             Code::Duplicate => "E_DUPLICATE",
+            Code::Ambiguous => "E_AMBIGUOUS",
             Code::Dimension => "E_DIMENSION",
             Code::Value => "E_VALUE",
             Code::Argument => "E_ARGUMENT",

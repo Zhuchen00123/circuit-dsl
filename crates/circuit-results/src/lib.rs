@@ -64,7 +64,7 @@ pub use export::{
     Export, SCHEMA, non_finite_diagnostics, to_csv, to_csv_with_diagnostics, to_json,
     to_json_value, to_json_with_diagnostics,
 };
-pub use expr::{Expr, Value, eval};
+pub use expr::{Expr, Value, eval, from_ir};
 pub use measure::{Measured, Measurement, measure, measure_signal, reduce};
 pub use resample::{OutputGrid, resample_time};
 

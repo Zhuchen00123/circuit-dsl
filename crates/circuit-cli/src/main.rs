@@ -100,9 +100,44 @@ impl Format {
     }
 }
 
+/// Stack for the thread every command runs on.
+///
+/// The parser and the result-expression evaluator are recursive, and an
+/// expression may nest up to `circuit_core::limits::MAX_EXPR_DEPTH` levels
+/// before either refuses it. An unoptimised build needs several kilobytes of
+/// stack per level, so the default 1 MiB main thread would abort the process —
+/// with no diagnostic and no exit code the CLI controls — well before the
+/// limit is reached. 64 MiB leaves a wide margin over the deepest accepted
+/// expression (round-4 FINDING-1).
+const WORK_STACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    // Run the command on a thread with a stack the accepted depth cannot
+    // exhaust. `main` itself stays thin: it only joins the worker and turns
+    // its result into an exit code.
+    let worker = std::thread::Builder::new()
+        .name("cdsl".to_string())
+        .stack_size(WORK_STACK_BYTES)
+        .spawn(move || dispatch(&cli));
+
+    match worker {
+        Ok(handle) => match handle.join() {
+            Ok(code) => ExitCode::from(code),
+            Err(_) => {
+                eprintln!("error[E_INTERNAL]: the processing thread panicked");
+                ExitCode::from(EXIT_USER_ERROR)
+            }
+        },
+        Err(e) => {
+            eprintln!("error[E_INTERNAL]: cannot start the processing thread: {e}");
+            ExitCode::from(EXIT_USER_ERROR)
+        }
+    }
+}
+
+fn dispatch(cli: &Cli) -> u8 {
     let result = match &cli.command {
         Command::Check { file, json } => check::check(file, *json, cli.verbose),
         Command::Run {
@@ -119,8 +154,8 @@ fn main() -> ExitCode {
     };
 
     match result {
-        Ok(()) => ExitCode::from(EXIT_OK),
-        Err(code) => ExitCode::from(code),
+        Ok(()) => EXIT_OK,
+        Err(code) => code,
     }
 }
 

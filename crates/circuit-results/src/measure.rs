@@ -18,18 +18,21 @@
 //!
 //! # Complex signals
 //!
-//! All four measurements are defined on the **magnitude** of a complex
-//! signal: `max`/`min` return the largest/smallest `|z|`, and `avg`/`rms`
-//! integrate `|z|` and `|z|²`. For real signals the sample value itself is the
-//! magnitude (`magnitudes()` does not take an absolute value of real data), so
-//! `max` of a negative voltage is that negative voltage — use `abs(v(...))`
-//! in the measurement expression when a magnitude is wanted.
+//! `avg` and `rms` are defined on the **magnitude** of a complex signal
+//! (`|z|` and `|z|²`): an integral needs no ordering. `max` and `min` do need
+//! one, and a complex number has none, so reducing a complex value to an
+//! extreme is reported as [`Code::Type`] with the advice to write `abs(...)`
+//! first — the reduction never silently ranks magnitudes. For real signals the
+//! sample value itself is the magnitude (`magnitudes()` does not take an
+//! absolute value of real data), so `max` of a negative voltage is that
+//! negative voltage — use `abs(v(...))` in the measurement expression when a
+//! magnitude is wanted.
 
 use circuit_core::units::Dimension;
 use circuit_core::{Code, Diagnostic};
 
 use crate::dataset::{Axis, Dataset};
-use crate::expr::{self, Expr, Value};
+use crate::expr::{self, EvalSite, Expr, Value};
 use crate::format_number;
 
 /// The four measurements the language defines.
@@ -80,18 +83,34 @@ pub struct Measured {
     /// the signal's dimension for `avg`/`rms` as well (the time integral
     /// cancels the time dimension of `dt`).
     pub unit: Dimension,
+    /// The analysis identity the value was taken from (`ac1`), empty when it
+    /// is not known (a hand-built value, or a reduction with no dataset).
+    pub analysis: String,
 }
 
 impl Measured {
+    /// A measurement with no analysis identity yet: [`reduce`] fills it from
+    /// the dataset it reduced, and [`Measured::with_analysis`] sets it by hand.
     pub fn new(name: impl Into<String>, value: f64, unit: Dimension) -> Self {
         Self {
             name: name.into(),
             value,
             unit,
+            analysis: String::new(),
         }
     }
 
+    /// Record which analysis the value was taken from.
+    pub fn with_analysis(mut self, analysis: impl Into<String>) -> Self {
+        self.analysis = analysis.into();
+        self
+    }
+
     /// `name = value unit`, e.g. `vrms = 1.2345 V`.
+    ///
+    /// Deliberately unchanged by the analysis identity: this text is what the
+    /// existing output and tests match. Use [`Measured::render_with_analysis`]
+    /// when the identity matters.
     pub fn render(&self) -> String {
         format!(
             "{} = {} {}",
@@ -100,16 +119,29 @@ impl Measured {
             self.unit
         )
     }
+
+    /// `name = value unit (ac1)`, or exactly [`Measured::render`] when the
+    /// analysis is not known.
+    pub fn render_with_analysis(&self) -> String {
+        if self.analysis.is_empty() {
+            self.render()
+        } else {
+            format!("{} ({})", self.render(), self.analysis)
+        }
+    }
 }
 
 /// Evaluate `expr` against `dataset` and reduce it with `kind`.
+///
+/// The measurement's own name is the evaluation site: a diagnostic raised
+/// inside the expression says which `measure` asked for the value.
 pub fn measure(
     kind: Measurement,
     name: &str,
     expr: &Expr,
     dataset: &Dataset,
 ) -> Result<Measured, Diagnostic> {
-    let value = expr::eval(expr, dataset)?;
+    let value = expr::eval_at(expr, dataset, &EvalSite::measure(name))?;
     reduce(kind, name, &value, &dataset.axis, &dataset.analysis)
 }
 
@@ -126,8 +158,9 @@ pub fn measure_signal(
 
 /// Reduce an already-evaluated value.
 ///
-/// `analysis` is the analysis id the value came from; it is only used to make
-/// the "no time axis" diagnostic point at the right place.
+/// `analysis` is the analysis id the value came from. It is what the "no time
+/// axis" diagnostic points at, and it is stamped on the result so display and
+/// export can say which analysis a measure belongs to.
 pub fn reduce(
     kind: Measurement,
     name: &str,
@@ -135,19 +168,34 @@ pub fn reduce(
     axis: &Axis,
     analysis: &str,
 ) -> Result<Measured, Diagnostic> {
-    match kind {
-        Measurement::Max | Measurement::Min => extremes(kind, name, value),
-        Measurement::Avg | Measurement::Rms => integral(kind, name, value, axis, analysis),
-    }
+    let measured = match kind {
+        Measurement::Max | Measurement::Min => extremes(kind, name, value)?,
+        Measurement::Avg | Measurement::Rms => integral(kind, name, value, axis, analysis)?,
+    };
+    Ok(measured.with_analysis(analysis))
 }
 
 /// Sample extremes. No axis is needed: this is a property of the samples, not
 /// of where they were taken.
 ///
+/// The samples must be real: a complex value has no ordering, so it is a
+/// [`Code::Type`] error (see the module docs) rather than an implicit ranking
+/// of magnitudes.
+///
 /// A `NaN` anywhere makes the result `NaN` rather than being skipped — the
 /// exporter turns it into `null` and warns, so a non-finite result stays
 /// visible instead of silently becoming a plausible-looking number.
 fn extremes(kind: Measurement, name: &str, value: &Value) -> Result<Measured, Diagnostic> {
+    if value.is_complex() {
+        return Err(Diagnostic::error(
+            Code::Type,
+            format!(
+                "cannot take the {} of `{name}`: the value is complex, and a complex number has no ordering",
+                kind.name()
+            ),
+        )
+        .with_note("apply abs(...) first to reduce the magnitude of a complex signal"));
+    }
     let samples = value.magnitudes();
     if samples.is_empty() {
         return Err(Diagnostic::error(
@@ -393,9 +441,11 @@ mod tests {
         assert_close(lo.value, -2.0, 1e-12);
     }
 
+    /// Round 3: a complex value is no longer reduced through its magnitude.
+    /// |3+4i| = 5 etc. are not silently ranked: the user is told to write
+    /// abs(...), which then works.
     #[test]
-    fn complex_measurements_use_the_magnitude() {
-        // |3+4i| = 5, |0+2i| = 2, |1+0i| = 1.
+    fn complex_max_and_min_are_rejected_with_an_abs_hint() {
         let ds = Dataset::new(
             "exp",
             "ac1",
@@ -415,16 +465,89 @@ mod tests {
         )
         .expect("well formed");
 
-        let hi = measure_signal(Measurement::Max, "vmax", "v(out)", &ds).expect("max");
+        let err = measure_signal(Measurement::Max, "vmax", "v(out)", &ds)
+            .expect_err("a complex value has no maximum");
+        assert_eq!(err.code, Code::Type);
+        assert!(err.message.contains("complex"), "{}", err.message);
+        assert!(
+            err.notes.iter().any(|n| n.contains("abs")),
+            "the note should point at abs(): {:?}",
+            err.notes
+        );
+        let err = measure_signal(Measurement::Min, "vmin", "v(out)", &ds)
+            .expect_err("a complex value has no minimum");
+        assert_eq!(err.code, Code::Type);
+
+        // The advice works: abs(...) makes the value real, and then the
+        // extremes are defined again.
+        let hi = measure(Measurement::Max, "vmax", &Expr::voltage("out").abs(), &ds)
+            .expect("abs() makes the value real");
         assert_close(hi.value, 5.0, 1e-12);
-        let lo = measure_signal(Measurement::Min, "vmin", "v(out)", &ds).expect("min");
+        let lo = measure(Measurement::Min, "vmin", &Expr::voltage("out").abs(), &ds)
+            .expect("abs() makes the value real");
         assert_close(lo.value, 1.0, 1e-12);
 
-        // avg/rms over a complex signal is defined on the magnitude, but the
-        // axis is a frequency axis, so it is still a type error.
+        // avg/rms over a complex signal are still defined on the magnitude;
+        // the frequency axis is what makes these a type error.
         let err = measure_signal(Measurement::Rms, "vrms", "v(out)", &ds)
             .expect_err("frequency is not time");
         assert_eq!(err.code, Code::Type);
+    }
+
+    #[test]
+    fn complex_avg_still_integrates_the_magnitude() {
+        // |3| = 3 and |0+4i| = 4 over t = {0, 1}: the trapezoid average of the
+        // magnitude is 3.5. avg/rms keep their documented magnitude meaning.
+        let ds = Dataset::new(
+            "exp",
+            "tran1",
+            "tran",
+            Axis::Time(vec![0.0, 1.0]),
+            vec![Signal::complex(
+                "v(out)",
+                VOLTAGE,
+                vec![Complex::new(3.0, 0.0), Complex::new(0.0, 4.0)],
+            )],
+            BackendInfo::new("test", "0"),
+            &Limits::default(),
+        )
+        .expect("well formed");
+        let avg = measure_signal(Measurement::Avg, "vavg", "v(out)", &ds).expect("avg");
+        assert_close(avg.value, 3.5, 1e-12);
+        assert_eq!(avg.unit, VOLTAGE);
+    }
+
+    /// Round 3: every measurement carries the analysis it was taken from.
+    #[test]
+    fn measured_records_the_analysis_identity() {
+        let ds = non_uniform();
+        let avg =
+            measure_signal(Measurement::Avg, "vavg", "v(out)", &ds).expect("tran has a time axis");
+        assert_eq!(avg.analysis, "tran1");
+        assert_eq!(
+            avg.render(),
+            "vavg = 2 V",
+            "render() is unchanged by the identity"
+        );
+        assert_eq!(avg.render_with_analysis(), "vavg = 2 V (tran1)");
+
+        // max/min take the identity from the dataset too.
+        let hi = measure_signal(Measurement::Max, "vmax", "v(out)", &ds).expect("max");
+        assert_eq!(hi.analysis, "tran1");
+
+        // reduce() fills it from its own parameter.
+        let value = Value::real(VOLTAGE, vec![1.0, 5.0]);
+        let reduced = reduce(Measurement::Max, "vmax", &value, &Axis::None, "dc1").expect("max");
+        assert_eq!(reduced.analysis, "dc1");
+        assert_eq!(reduced.render(), "vmax = 5 V");
+        assert_eq!(reduced.render_with_analysis(), "vmax = 5 V (dc1)");
+
+        // An unknown identity renders exactly like render().
+        let plain = Measured::new("x", 1.0, VOLTAGE);
+        assert_eq!(plain.analysis, "");
+        assert_eq!(plain.render_with_analysis(), "x = 1 V");
+        let named = Measured::new("x", 1.0, VOLTAGE).with_analysis("ac1");
+        assert_eq!(named.render_with_analysis(), "x = 1 V (ac1)");
     }
 
     #[test]
@@ -589,8 +712,16 @@ mod tests {
         assert!(err.message.contains("no samples"), "{}", err.message);
     }
 
+    /// Round 4 (R4-01): a signal sample that is already NaN is refused by the
+    /// read that sees it.
+    ///
+    /// Round 3 let the NaN through and reduced it to a NaN measurement; the
+    /// round-4 value policy (contract §1.3.3) is stricter on purpose, so an
+    /// illegal sample can never be carried into a measurement or a column. The
+    /// sample is still not skipped: it is named, with its coordinate, and the
+    /// diagnostic says which `measure` asked for the value.
     #[test]
-    fn nan_samples_make_the_extreme_nan_rather_than_being_skipped() {
+    fn nan_samples_are_refused_when_read_rather_than_becoming_a_nan_measurement() {
         let ds = Dataset::new(
             "exp",
             "tran1",
@@ -601,7 +732,16 @@ mod tests {
             &Limits::default(),
         )
         .expect("well formed");
-        let hi = measure_signal(Measurement::Max, "vmax", "v(out)", &ds).expect("max");
-        assert!(hi.value.is_nan(), "expected NaN, got {}", hi.value);
+        let err = measure_signal(Measurement::Max, "vmax", "v(out)", &ds)
+            .expect_err("a NaN sample has no maximum");
+        assert_eq!(err.code, Code::Value, "{}", err.render_plain());
+        let text = err.render_plain();
+        assert!(text.contains("non-finite"), "{text}");
+        assert!(text.contains("v(out)"), "{text}");
+        assert!(text.contains("time = 1"), "{text}");
+        assert!(
+            text.contains("measure `vmax`"),
+            "the site must be named: {text}"
+        );
     }
 }

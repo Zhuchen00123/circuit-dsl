@@ -19,7 +19,7 @@
 
 use circuit_core::diagnostic::{Code, Diagnostic};
 use circuit_core::span::SourceSpan;
-use circuit_core::units::{self, Quantity};
+use circuit_core::units::{self, Dimension, Quantity};
 
 use crate::ast::{BinaryOp, Call, Expr, ExprKind, UnaryOp};
 
@@ -319,17 +319,45 @@ fn eval_binary(
                 x.dimension,
             )
         }
-        Mul => x * y,
+        // Both operands are user-written, so their dimensions can leave the
+        // exponent range (a long `a*b*c*...` chain): that is a diagnostic, not
+        // a debug panic and not the wrapped exponent a release build would
+        // otherwise produce (round-4 R4-02).
+        Mul => x
+            .checked_mul(y)
+            .ok_or_else(|| dimension_exponent_overflow("*", x, y, span))?,
         Div => {
             if y.value == 0.0 {
                 return Err(Diagnostic::error(Code::Value, "division by zero").at(b_span));
             }
-            x / y
+            x.checked_div(y)
+                .ok_or_else(|| dimension_exponent_overflow("/", x, y, span))?
         }
         _ => unreachable!("logical and comparison handled above"),
     };
 
     Ok(Value::Num(result))
+}
+
+/// The dimension of a product or quotient does not fit the exponent range.
+///
+/// The exponents are `i8`, so a long enough chain of `*` or `/` on
+/// user-written quantities can exhaust them. The message names both operands'
+/// dimensions and the bound instead of an internal integer type.
+fn dimension_exponent_overflow(op: &str, a: Quantity, b: Quantity, span: SourceSpan) -> Diagnostic {
+    Diagnostic::error(
+        Code::Dimension,
+        format!(
+            "`{op}` on a quantity in {} and one in {} has a dimension outside the representable range",
+            a.dimension, b.dimension
+        ),
+    )
+    .at(span)
+    .with_note(format!(
+        "a dimension exponent is held as a signed 8-bit integer ({}..={}); shorten the product or split it into named parameters",
+        Dimension::MIN_EXPONENT,
+        Dimension::MAX_EXPONENT
+    ))
 }
 
 fn eval_call(call: &Call, vars: &dyn Variables) -> Result<Value, Diagnostic> {

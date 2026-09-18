@@ -231,7 +231,9 @@ mod tests {
         assert_eq!(format_quantity(Quantity::scalar(2.0)), "2");
         assert_eq!(format_quantity(Quantity::scalar(1234.5)), "1234.5");
         // V*A (power) has no conventional single symbol, so no prefix either.
-        let power = Quantity::volts(2.0) * Quantity::amps(3.0);
+        let power = Quantity::volts(2.0)
+            .checked_mul(Quantity::amps(3.0))
+            .expect("V*A fits");
         assert_eq!(format_quantity(power), "6 V*A");
     }
 
@@ -287,7 +289,9 @@ mod tests {
     /// `V*A` is the one dimension whose display has no unit suffix to resolve.
     #[test]
     fn compound_dimensions_do_not_claim_a_unit() {
-        let power = Quantity::volts(2.0) * Quantity::amps(3.0);
+        let power = Quantity::volts(2.0)
+            .checked_mul(Quantity::amps(3.0))
+            .expect("V*A fits");
         let text = format_quantity(power);
         let suffix = text.split_once(' ').expect("mantissa and unit").1;
         assert_eq!(suffix, "V*A");

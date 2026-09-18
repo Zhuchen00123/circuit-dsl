@@ -30,6 +30,20 @@
 `crates/circuit-dsl/tests/reference_path_regression.rs`（8 个）与
 `crates/circuit-backend/tests/phase_regression.rs`（6 个）继续保留。
 
+**第 4 轮（阶段 A + 阶段 B）**新增 10 个测试目标与一次契约改写。阶段 A 的
+`circuit-results/tests/r4_expr_policy.rs`（16）、`circuit-session/tests/r4_export_diagnostics.rs`（7）、
+`circuit-cli/tests/r4_repro_cli.rs`（8）、`r4_cli_repl_parity.rs`（3）、`r4_output_integrity.rs`（3）、
+`r4_regressions.rs`（5）覆盖 R4-01 / R4-02 / R4-03 的四个复现输入、raw Dataset 导出警告、
+CLI 与 REPL 同一表达式的数值/错误一致，以及"失败不落盘"；阶段 B 的
+`circuit-dsl/src/param_graph.rs`（17 个单元测试）、`circuit-dsl/tests/r4b_param_graph.rs`（13）、
+`circuit-cli/tests/r4b_topo_sweep.rs`（6）、`r4b_regressions.rs`（3）、
+`circuit-session/tests/r4b_session_dag.rs`（3）覆盖参数 DAG（前向引用、多层链、菱形图、环与
+span、未知名字）、同名实例参数互不污染、覆盖后重算、REPL 事务性、check 期拓扑扫描拒绝与
+普通数值扫描正控制。`crates/circuit-dsl/tests/elaborate.rs` 只改了两条旧规则测试并改名：
+`a_forward_parameter_reference_is_rejected` → `a_forward_parameter_reference_is_resolved`、
+`a_self_referential_parameter_is_rejected` → `a_self_referential_parameter_is_a_cycle`，
+其余 65 条未动（该文件仍是 67 个测试）。
+
 **CLI 端到端测试** `crates/circuit-cli/tests/e2e.rs`（18 个）用
 `CARGO_BIN_EXE_cdsl` 启动真正的二进制，跑 `examples/` 里的真实文件，读回它写出的
 CSV/JSON 并解析数值。它同时验证退出码、stderr 诊断与 stdout 摘要。
@@ -102,7 +116,20 @@ cargo test -p circuit-results --lib measure::tests
 cargo test -p circuit-cli     --test e2e run_divider
 ```
 
-本仓库的实际状态（rev4，门禁三条全部实跑）：`cargo test --workspace` → **457 passed / 0 failed /
+**本仓库当前状态（第 4 轮）**：`cargo test --workspace` → **660 passed / 0 failed / exit 0**
+（第 3 轮基线 554）。构成：阶段 A 冻结快照 **618**（`docs/review-evidence/round4/acceptance.md`），
+阶段 B 新增 **42** 个测试——`crates/circuit-dsl/src/param_graph.rs` 的 17 个单元测试、
+`crates/circuit-dsl/tests/r4b_param_graph.rs` 13、`circuit-cli/tests/r4b_topo_sweep.rs` 6、
+`circuit-cli/tests/r4b_regressions.rs` 3、`circuit-session/tests/r4b_session_dag.rs` 3
+（`docs/review-evidence/round4/qa-acceptance-phase-b.md` §2）——外加
+`crates/circuit-dsl/tests/elaborate.rs` 里两条按契约 §4.4 **改写并改名**的旧规则测试
+（数量不变，该文件仍是 67 个）。618 + 42 = 660。
+`cargo clippy --workspace --all-targets -- -D warnings` 与 `cargo fmt --all -- --check` 在阶段 A
+冻结快照上实测 **exit 0**（`docs/review-evidence/round4/acceptance.md` §Gates）；第 4 轮最终复跑
+由 lead 在 task-15 执行。**测试计数只在这一处与 `docs/review-evidence/round4/` 里维护**；
+下面的 rev5/rev4 段落是历史记录，保留不改。
+
+（rev4 历史，仅供对照）门禁三条全部实跑：`cargo test --workspace` → **457 passed / 0 failed /
 exit 0**；`cargo clippy --workspace --all-targets -- -D warnings` → **exit 0**；
 `cargo fmt --all -- --check` → **exit 0**。日志 `target/round2-logs/rev4-workspace-test.txt`（rev4）、
 `final-workspace-test.txt`（rev3）、`final-clippy.txt`、`final-fmt.txt`，冻结清单 `target/round2-logs/freeze-manifest.txt`（rev4）。
@@ -146,6 +173,8 @@ test result: ok. 25 passed; 0 failed; 0 ignored; ...   （circuit-session tests/
 test result: ok.  5 passed; 0 failed; 0 ignored; ...   （circuit-session tests/tran_output_interval.rs）
 test result: ok.  1 passed; ...                       （circuit-results 的 doc-test；其余 4 个目标为 0）
 ```
+
+**（rev4 历史上为 457；第 3 轮实测清单见 `docs/review-evidence/round3/acceptance.md`；第 4 轮经本文件开头与 `docs/review-evidence/round4/` 更新为 660 个测试全部通过、退出码 0。）**
 
 **合计 457 个测试，全部通过，`cargo test --workspace` 退出码 0。**
 （15+21+6+6+6+4+9+18+11+58+84+67+6+8+15+83+9+25+5+1 = 457；24 条 `test result:` 行 = **19 个测试
@@ -310,7 +339,13 @@ test result: ok.  1 passed; ...                       （circuit-results 的 doc
 | 声明边沿相对窗口过细（**由声明波形导致的**步数预算超限） | `E_LIMIT`，消息含所需步数与归因上下文（`declared waveform timing` / `solver step` / `effective step`）；**用户自己的 `max_step` 造成的超预算不报错** | `output_interval_regression.rs::the_step_budget_blames_the_waveform_not_the_users_max_step`（消息与归因）+ `::an_edge_that_cannot_be_honoured_is_refused_not_widened`（`E_LIMIT` 码）；CLI 实测 `rise: 1.ps` + `stop: 1.s`（无 `max_step`）→ exit 1，消息 `the declared source rise/fall/period is too fine for this simulation window: honouring it would need about 1000000000000 solver steps, over the limit of 1000000`（`cli-qa.md` §5 F8/F9 是同一路径的旧文案实例） |
 | 纯 `max_step` 造成的步数超预算（没有声明边沿，或没有波形约束时同样超预算） | **不报错**：`max_step` 是用户显式请求，不由波形契约拒绝（但也没有运行期步数上限，见 §7） | 本文件作者 CLI 实测（rev3）：纯 DC 源 + RC + `tran stop: 1.s, max_step: 1.ns` → `cdsl check` **exit 0**（修复前曾被误拒，代码审核 W6-2 反例） |
 | 输出重采样规模超过 `Limits::max_result_values` | `E_LIMIT`（**重采样层**；`check` 是静态检查，只有 `run` 能报） | `tran_output_interval.rs::an_oversized_output_grid_is_rejected_and_truncates_nothing`、`resample.rs::an_oversized_output_is_rejected_not_truncated` |
-| 未声明的参数名 | `E_NAME`（参数按声明顺序求值，前向引用就是未声明） | `an_undeclared_parameter_is_an_error`、`a_forward_parameter_reference_is_rejected` |
+| 未声明的参数名 | `E_NAME`（前向引用在同一 body 内合法；环才报 `E_PARAM_CYCLE`） | `an_undeclared_parameter_is_an_error`、`a_forward_parameter_reference_is_resolved`（前向引用按依赖序求值）、`r4b_param_graph.rs` 的未知名字用例 |
+| 参数自引用 / 多节点环 | `E_PARAM_CYCLE` + 闭合路径 + 每个参与声明的位置（不再是 `E_NAME`） | `a_self_referential_parameter_is_a_cycle`、`r4b_param_graph.rs` 的两节点与三节点环 |
+| 结果表达式非法值：`sqrt(-1)`、`min(sqrt(-1),2)`、`1e308*1e308`、非有限复数分量 | 检查（常量表达式）或运行期 `E_VALUE`，带分析、样本坐标与 index | `r4_expr_policy.rs`（16）、`r4_repro_cli.rs`（真实 CLI，debug+release）、`r4_cli_repl_parity.rs` |
+| 量纲指数溢出（128 个 `v(:vin)` 因子、`V^-129`） | `E_DIMENSION`；debug 不 panic、release 不回绕 | `r4_repro_cli.rs`、`r4_expr_policy.rs`、reviewer 的 `dimbound/neg131` |
+| 表达式深度超过 `MAX_EXPR_DEPTH`（256） | `E_LIMIT`（不 abort、无栈溢出） | `parser.rs` 的深度护栏测试、`expr.rs` 的 `depth()` 边界测试、reviewer 的 `nest300`/`const512` |
+| 扫描拓扑参数（`for` 迭代源、`if` 条件、生成名称、实例 `params:` 绑定） | `E_TOPO_PARAM` + 解释路径，check / run / `:load` 一致 | `r4b_topo_sweep.rs`（6）、`r4b_session_dag.rs`、`examples/parameter_sweep.cdsl` 正控制 |
+| raw Dataset 含 NaN/±inf 的 CSV/JSON 导出 | 空字段 / `null` + 每个非有限信号一条警告，CLI 与 REPL 打印 | `r4_export_diagnostics.rs`（7）、reviewer 的手工 Dataset 探针 |
 | 器件数/循环数超限 | `E_LIMIT` | `the_device_limit_is_enforced`（用 `Limits::for_tests()`）、`the_loop_limit_is_enforced` |
 | 扫描参数有问题（步长为 0、方向相反、缺 step） | `E_SWEEP` | `sweep.rs::a_zero_step_is_rejected`、`a_backwards_step_is_rejected`、`a_missing_step_is_rejected_with_advice` |
 | 冲突理想源（奇异矩阵） | `E_SINGULAR`，且保留引擎原文 "singular" | `adapter.rs::a_singular_circuit_is_reported_not_swallowed` |
@@ -365,9 +400,14 @@ stdout 0 字节、零结果文件，从未观察到 2；任何依赖「2 = 内�
 - **未暴露的分析与器件**：噪声、灵敏度、PZ、TF、Fourier/FFT、Monte Carlo、
   多参数联合扫描；MOSFET、BJT、受控源、行为源、开关、互感、`include`/模型文件。
   后端可能声明支持其中一部分，本项目既不测试也不声称（`docs/backend-evaluation.md` §2、§7）。
-- **结果表达式语言未接通 CLI**：`circuit-results::expr` 有求值器与单元测试，
-  但 `cdsl` 的 `measure` 只支持 `v(...)`/`i(...)` 探针形式，没有从源文件写
-  任意结果表达式的路径。
+- **结果表达式的运行期边界**（第 3 轮起已接通 CLI 与 REPL；早前"未接通 CLI"的说法已废弃）：
+  `derive` 与表达式形式的 `measure` 都走 `circuit-results::expr`，但表达式仍不支持
+  比较/布尔/条件、数组、字典、带量纲字面量、自定义函数以及 `derive` 之间的引用
+  （`docs/language.md` §7.8）；深度超过 `MAX_EXPR_DEPTH`（256）报 `E_LIMIT`。
+  **未验证**：交互式 TTY 会话、磁盘写失败路径，以及"手工构造的超深 `Expr` 直接调用
+  公开的 `expr::is_constant` / `expr::from_ir`"——这两个 API 仍是递归实现，CLI 路径
+  由解析器的深度护栏先挡住（`docs/review-evidence/round4/acceptance.md` 的
+  "Deviations and limits recorded"）。
 - **运行中源断点的精度只有单激励的界（限制项，不是通过项）。**
   本轮新增 `crates/circuit-backend/tests/source_breakpoint_regression.rs`（6 个测试）用真实产品路径
   覆盖非零 `delay`：τ = 100 µs、`delay = 100 µs`、`rise = fall = 1 µs`、10 个脉冲 40 个断点，

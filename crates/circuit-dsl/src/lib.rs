@@ -18,6 +18,7 @@ pub mod complete;
 pub mod elaborate;
 pub mod eval;
 pub mod lexer;
+pub mod param_graph;
 pub mod parser;
 pub mod token;
 

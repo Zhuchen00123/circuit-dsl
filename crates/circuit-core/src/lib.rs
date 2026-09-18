@@ -35,8 +35,9 @@ pub use ir::{
 };
 pub use limits::Limits;
 pub use plan::{
-    AcSweep, AnalysisKind, AnalysisPlan, AnalysisTask, MeasureKind, MeasureRequest, NamedProbe,
-    Probe, Sweep, SweepKind, SweepTarget, TranSpec,
+    AcSweep, AnalysisBinding, AnalysisKind, AnalysisPlan, AnalysisTask, DeriveRequest, ExprIr,
+    MeasureKind, MeasureRequest, NamedProbe, Probe, ProbeRef, Sweep, SweepKind, SweepTarget,
+    TranSpec,
 };
 pub use span::{SourceId, SourceMap, SourceSpan, Spanned};
 pub use units::{Dimension, Quantity};

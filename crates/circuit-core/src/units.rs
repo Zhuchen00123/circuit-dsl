@@ -44,27 +44,62 @@ impl Dimension {
         Self { volt, amp, second }
     }
 
-    pub const fn mul(self, rhs: Self) -> Self {
-        Self {
-            volt: self.volt + rhs.volt,
-            amp: self.amp + rhs.amp,
-            second: self.second + rhs.second,
+    /// The largest exponent this representation can hold. Diagnostics quote the
+    /// range [`Dimension::MIN_EXPONENT`]`..=`[`Dimension::MAX_EXPONENT`] rather
+    /// than a single bound, because both ends are reachable.
+    pub const MAX_EXPONENT: i8 = i8::MAX;
+
+    /// The smallest exponent this representation can hold (`-128`, reachable:
+    /// `V^-128` is a legal dimension).
+    pub const MIN_EXPONENT: i8 = i8::MIN;
+
+    /// `self * rhs`, checked: `None` when any exponent leaves the `i8`
+    /// range.
+    ///
+    /// The exponents stay `i8` on purpose: a dimension is a small exponent
+    /// vector, and a wider integer would only move the same cliff further away
+    /// for an expression the user can grow arbitrarily long. What matters is
+    /// that no *user-reachable* operation can overflow — so the unchecked
+    /// `+`/`-`/`*` this used to be are deliberately gone and every call site
+    /// has to deal with `None` (round-4 R4-02: `cdsl run` panicked in debug and
+    /// wrapped silently in release on a 128-factor voltage product).
+    pub const fn checked_mul(self, rhs: Self) -> Option<Self> {
+        match (
+            self.volt.checked_add(rhs.volt),
+            self.amp.checked_add(rhs.amp),
+            self.second.checked_add(rhs.second),
+        ) {
+            (Some(volt), Some(amp), Some(second)) => Some(Self { volt, amp, second }),
+            _ => None,
         }
     }
 
-    pub const fn div(self, rhs: Self) -> Self {
-        Self {
-            volt: self.volt - rhs.volt,
-            amp: self.amp - rhs.amp,
-            second: self.second - rhs.second,
+    /// `self / rhs`, checked: `None` when any exponent leaves the `i8`
+    /// range.
+    pub const fn checked_div(self, rhs: Self) -> Option<Self> {
+        match (
+            self.volt.checked_sub(rhs.volt),
+            self.amp.checked_sub(rhs.amp),
+            self.second.checked_sub(rhs.second),
+        ) {
+            (Some(volt), Some(amp), Some(second)) => Some(Self { volt, amp, second }),
+            _ => None,
         }
     }
 
-    pub const fn pow(self, n: i8) -> Self {
-        Self {
-            volt: self.volt * n,
-            amp: self.amp * n,
-            second: self.second * n,
+    /// `self.pow(n)`, checked: `None` when any exponent leaves the `i8`
+    /// range.
+    ///
+    /// No DSL construct raises a dimension to a power today, but the caller
+    /// would be the same one, so the checked form is the only form.
+    pub const fn checked_pow(self, n: i8) -> Option<Self> {
+        match (
+            self.volt.checked_mul(n),
+            self.amp.checked_mul(n),
+            self.second.checked_mul(n),
+        ) {
+            (Some(volt), Some(amp), Some(second)) => Some(Self { volt, amp, second }),
+            _ => None,
         }
     }
 
@@ -231,21 +266,36 @@ impl Quantity {
     }
 }
 
-// Quantity arithmetic goes through the standard operators so that `a * b`,
-// `a / b`, and `-a` read naturally at call sites. Dimensions propagate as
-// described above; nothing here can fail, so the operators are infallible.
+// `-a` reads naturally at call sites, so it stays an operator. Multiplication
+// and division used to be operators too; they are `checked_*` methods now
+// because their dimensions can leave the exponent range for input the user
+// controls (a form's `a*b*c*...` chain in a parameter expression, for
+// instance). An infallible operator would have to pick a behaviour for that
+// case — panic in debug, wrap in release — and both are wrong: the caller
+// reports a diagnostic instead.
 
-impl std::ops::Mul for Quantity {
-    type Output = Quantity;
-    fn mul(self, rhs: Self) -> Quantity {
-        Quantity::new(self.value * rhs.value, self.dimension.mul(rhs.dimension))
+impl Quantity {
+    /// `self * rhs` with checked dimension exponents.
+    ///
+    /// `None` when the product's dimension does not fit the exponent range;
+    /// the numeric product is not computed in that case.
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        Some(Self::new(
+            self.value * rhs.value,
+            self.dimension.checked_mul(rhs.dimension)?,
+        ))
     }
-}
 
-impl std::ops::Div for Quantity {
-    type Output = Quantity;
-    fn div(self, rhs: Self) -> Quantity {
-        Quantity::new(self.value / rhs.value, self.dimension.div(rhs.dimension))
+    /// `self / rhs` with checked dimension exponents.
+    ///
+    /// `None` when the quotient's dimension does not fit the exponent range.
+    /// A zero *numeric* denominator is a separate, caller-visible condition and
+    /// is not decided here.
+    pub fn checked_div(self, rhs: Self) -> Option<Self> {
+        Some(Self::new(
+            self.value / rhs.value,
+            self.dimension.checked_div(rhs.dimension)?,
+        ))
     }
 }
 
@@ -597,36 +647,51 @@ mod tests {
         assert_eq!(sci.dimension, TIME);
     }
 
+    /// Shorthand for the tests below: every product/quotient here is known to
+    /// fit, so the checked result is unwrapped with the offending operation
+    /// named.
+    fn mul(a: Quantity, b: Quantity) -> Quantity {
+        a.checked_mul(b).expect("dimension exponents fit")
+    }
+
+    fn div(a: Quantity, b: Quantity) -> Quantity {
+        a.checked_div(b).expect("dimension exponents fit")
+    }
+
     #[test]
     fn arithmetic_derives_dimensions() {
         let v = Quantity::volts(2.0);
         let i = Quantity::amps(1e-3);
-        let r = v / i;
+        let r = div(v, i);
         assert_eq!(r.value, 2000.0);
         assert_eq!(r.dimension, RESISTANCE);
 
         // V * A = power; not a named dimension but must be tracked.
-        let p = v * i;
+        let p = mul(v, i);
         assert_eq!(p.dimension, Dimension::new(1, 1, 0));
         assert_eq!(dimension_name(p.dimension), None);
         assert_eq!(p.dimension.to_string(), "V*A");
 
         // F = A*s/V
-        let cap = Quantity::amps(1.0) * Quantity::seconds(1.0) / Quantity::volts(1.0);
+        let cap = div(
+            mul(Quantity::amps(1.0), Quantity::seconds(1.0)),
+            Quantity::volts(1.0),
+        );
         assert_eq!(cap.dimension, CAPACITANCE);
 
         // H = V*s/A
-        let ind = Quantity::volts(1.0) * Quantity::seconds(1.0) / Quantity::amps(1.0);
+        let ind = div(
+            mul(Quantity::volts(1.0), Quantity::seconds(1.0)),
+            Quantity::amps(1.0),
+        );
         assert_eq!(ind.dimension, INDUCTANCE);
 
         // Hz = 1/s
-        let f = Quantity::scalar(1.0) / Quantity::seconds(1.0);
+        let f = div(Quantity::scalar(1.0), Quantity::seconds(1.0));
         assert_eq!(f.dimension, FREQUENCY);
 
-        // Operators behave as derived above.
+        // Negation keeps its operator.
         assert_eq!((-v).value, -2.0);
-        assert_eq!(v * i, p);
-        assert_eq!(v / i, r);
     }
 
     #[test]
@@ -657,8 +722,38 @@ mod tests {
 
     #[test]
     fn pow_scales_exponents() {
-        assert_eq!(VOLTAGE.pow(2), Dimension::new(2, 0, 0));
-        assert_eq!(RESISTANCE.pow(-1), Dimension::new(-1, 1, 0));
+        assert_eq!(VOLTAGE.checked_pow(2), Some(Dimension::new(2, 0, 0)));
+        assert_eq!(RESISTANCE.checked_pow(-1), Some(Dimension::new(-1, 1, 0)));
+        // 2^7 volts to the 2nd is V^128, one past the representation.
+        let v127 = Dimension::new(127, 0, 0);
+        assert_eq!(v127.checked_mul(VOLTAGE), None);
+        assert_eq!(Dimension::new(-128, 0, 0).checked_div(VOLTAGE), None);
+        assert_eq!(VOLTAGE.checked_pow(127), Some(Dimension::new(127, 0, 0)));
+        // The exponent argument is an i8 too, so "one past the end" is written
+        // as a factor that reaches it: 2^64 leaves the range, 2^63 does not.
+        assert_eq!(
+            Dimension::new(2, 0, 0).checked_pow(63),
+            Some(Dimension::new(126, 0, 0))
+        );
+        assert_eq!(Dimension::new(2, 0, 0).checked_pow(64), None);
+        // The bound is reachable from both sides, and exactly in range is fine.
+        assert_eq!(
+            Dimension::new(127, 0, 0).checked_mul(DIMENSIONLESS),
+            Some(Dimension::new(127, 0, 0))
+        );
+    }
+
+    /// A 128-factor voltage product is the round-4 reproduction: V^127 is the
+    /// last representable exponent, so the 128th factor must be a `None`,
+    /// never a debug panic and never a wrapped exponent in release.
+    #[test]
+    fn a_long_dimension_chain_never_overflows() {
+        let mut product = DIMENSIONLESS;
+        for exponent in 1..=127i8 {
+            product = product.checked_mul(VOLTAGE).expect("exponent fits");
+            assert_eq!(product, Dimension::new(exponent, 0, 0));
+        }
+        assert_eq!(product.checked_mul(VOLTAGE), None);
     }
 
     #[test]

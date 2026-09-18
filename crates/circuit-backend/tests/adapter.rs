@@ -125,9 +125,11 @@ fn plan_for(name: &str, kind: AnalysisKind, probes: Vec<NamedProbe>) -> Analysis
             id: AnalysisId(0),
             kind,
             probes,
+            implicit_probes: Vec::new(),
             span: SourceSpan::synthetic(),
         }],
         param_overrides: Vec::new(),
+        derives: Vec::new(),
         measures: Vec::new(),
         span: SourceSpan::synthetic(),
     }
@@ -987,6 +989,7 @@ fn two_analyses_of_the_same_kind_get_distinct_names() {
             span: SourceSpan::synthetic(),
         }),
         probes: plan.tasks[0].probes.clone(),
+        implicit_probes: Vec::new(),
         span: SourceSpan::synthetic(),
     });
 
@@ -1040,12 +1043,14 @@ fn a_bad_probe_is_reported_once_not_once_per_analysis() {
         id: AnalysisId(1),
         kind: AnalysisKind::Op,
         probes: plan.tasks[0].probes.clone(),
+        implicit_probes: Vec::new(),
         span: SourceSpan::synthetic(),
     });
     plan.tasks.push(AnalysisTask {
         id: AnalysisId(2),
         kind: AnalysisKind::Op,
         probes: plan.tasks[0].probes.clone(),
+        implicit_probes: Vec::new(),
         span: SourceSpan::synthetic(),
     });
 

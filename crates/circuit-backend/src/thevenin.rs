@@ -491,6 +491,11 @@ impl TheveninBackend {
 
         let mut signals = Vec::new();
         let mut diagnostics = Diagnostics::new();
+        // Names that exist *only* because a result expression reads them. The
+        // session keeps them out of the output view unless the user also saved
+        // them (round-3 review B1): the read set and the export set are
+        // different sets on purpose.
+        let mut implicit_only: Vec<String> = Vec::new();
 
         if task.probes.is_empty() {
             // No explicit probe list: expose everything the engine produced,
@@ -503,8 +508,34 @@ impl TheveninBackend {
                     signals.push(make_signal(name, unit, &vector.data));
                 }
             }
+            // A result expression reads its own probes without a `save`, so the
+            // default set is widened by exactly those dependencies. They are
+            // added here so a default result keeps every signal it had before,
+            // and the caller decides separately which signals to export.
+            for probe in &task.implicit_probes {
+                if signals.iter().any(|s| s.name == probe.name) {
+                    continue;
+                }
+                match materialise_probe(circuit, probe, plot) {
+                    Ok(Some(signal)) => {
+                        implicit_only.push(signal.name.clone());
+                        signals.push(signal);
+                    }
+                    Ok(None) => diagnostics.push(
+                        Diagnostic::error(
+                            Code::Backend,
+                            format!("the backend did not report `{}`", probe.name),
+                        )
+                        .at(probe.span)
+                        .with_note("a result expression needs this signal; the analysis did not produce it"),
+                    ),
+                    Err(d) => diagnostics.push(d),
+                }
+            }
         } else {
-            for probe in &task.probes {
+            // The saved probes plus the expression dependencies: the user's
+            // list decides what is exported, this list decides what is read.
+            for probe in &task.read_probes() {
                 match materialise_probe(circuit, probe, plot) {
                     Ok(Some(signal)) => signals.push(signal),
                     Ok(None) => diagnostics.push(
@@ -558,6 +589,9 @@ impl TheveninBackend {
                 return Err(d);
             }
         };
+        // Provenance travels with the dataset so the session can tell an
+        // expression dependency apart from a signal the engine reported.
+        dataset.implicit_only = implicit_only;
         for d in diagnostics {
             dataset.push_diagnostic(d);
         }

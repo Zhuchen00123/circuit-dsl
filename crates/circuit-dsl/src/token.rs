@@ -208,6 +208,7 @@ pub const KEYWORDS: &[&str] = &[
     "tran",
     "save",
     "measure",
+    "derive",
     "resistor",
     "capacitor",
     "inductor",
@@ -243,6 +244,16 @@ mod tests {
         assert!(!is_keyword("r1"));
         assert!(is_reserved_name("end"));
         assert!(!is_reserved_name("value"));
+    }
+
+    /// Every experiment statement keyword is listed, so a session variable or
+    /// a declared name cannot shadow one. `derive` joined the list with the
+    /// result-expression feature.
+    #[test]
+    fn experiment_statement_keywords_are_all_listed() {
+        for word in ["op", "dc", "ac", "tran", "save", "measure", "derive"] {
+            assert!(is_keyword(word), "`{word}` should be a keyword");
+        }
     }
 
     #[test]

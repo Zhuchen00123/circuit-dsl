@@ -397,10 +397,10 @@ end
 // Stage 3: parameters
 // ---------------------------------------------------------------------------
 
-/// Parameters are declared in order and may refer to earlier ones, which
-/// makes a dependency cycle structurally impossible. A self-reference
-/// therefore fails as an ordinary undeclared name, with the declaration in
-/// scope named in the diagnostic.
+/// Parameters of one body are resolved through a dependency graph (phase B,
+/// contract §4.4): a forward reference is legal and the graph fixes the
+/// evaluation order, while source order only breaks ties. A self-reference is
+/// the one-node case of a dependency cycle and is reported as `E_PARAM_CYCLE`.
 #[test]
 fn parameters_are_resolved_in_declaration_order() {
     let c = ok(r#"
@@ -420,28 +420,42 @@ end
     assert_eq!(r1.param("value").unwrap().dimension, units::RESISTANCE);
 }
 
+/// A parameter that names itself has a circular definition. Since phase B the
+/// declarations of one body are resolved through a dependency graph, so the
+/// name *is* declared and the failure is a cycle (`E_PARAM_CYCLE`), not an
+/// unknown name.
 #[test]
-fn a_self_referential_parameter_is_rejected() {
+fn a_self_referential_parameter_is_a_cycle() {
     let text = err(r#"
 circuit :cyc do
   param :a, default: a
   node :x
 end
 "#);
-    assert_code(&text, Code::Name);
+    assert_code(&text, Code::ParamCycle);
+    assert!(!text.contains("[E_NAME]"), "{text}");
 }
 
+/// A forward reference inside one body is legal since phase B: the parameter
+/// graph is built before the body runs, so declaration order no longer decides
+/// what is visible. `b = 2 * a = 2 kohm` even though `a` is declared after
+/// `b`.
 #[test]
-fn a_forward_parameter_reference_is_rejected() {
-    let text = err(r#"
+fn a_forward_parameter_reference_is_resolved() {
+    let c = ok(r#"
 circuit :fwd do
   param :b, default: 2 * a
   param :a, default: 1.kohm
   node :x
+  voltage_source :v1, p: :x, n: :gnd, dc: 1.V
+  resistor :r1, p: :x, n: :gnd, value: b
 end
 "#);
-    assert_code(&text, Code::Name);
-    assert!(text.contains("not declared"), "{text}");
+    let r1 = c.circuits[0]
+        .device(c.circuits[0].device_id("r1").unwrap())
+        .unwrap();
+    assert_eq!(r1.param("value").unwrap().value, 2000.0);
+    assert_eq!(r1.param("value").unwrap().dimension, units::RESISTANCE);
 }
 
 #[test]

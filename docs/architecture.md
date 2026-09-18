@@ -9,7 +9,7 @@
 
 ```
 crates/circuit-core       语义数据结构、量纲与数值显示（无第三方仿真依赖）
-crates/circuit-dsl        lexer / parser / 展开 / 共享求值器 / 完备性判定
+crates/circuit-dsl        lexer / parser / 展开 / 共享求值器 / 参数依赖图 / 完备性判定
 crates/circuit-backend    后端契约 + Thevenin 适配 + 参数扫描驱动
 crates/circuit-results    结果数据集 / 表达式 / 测量 / 导出
 crates/circuit-session    会话状态与命令 + 实验执行（文件模式与 REPL 共用）
@@ -42,11 +42,14 @@ Vec<token::Token>
   ▼
 ast::Program                        名字未解析、量纲未检查
   │  circuit-dsl::elaborate::{compile, elaborate_experiment}
-  │  名字解析 · 量纲检查 · 参数求值 · 子电路/端口展开 · for/if 展开
+  │  参数 DAG · 名字解析 · 量纲检查 · 参数求值 · 子电路/端口展开 · for/if 展开
   ▼
 (circuit_core::ir::Circuit, circuit_core::plan::AnalysisPlan)
+  │  计划层已含结果表达式 IR 与分析绑定（ExprIr/ProbeRef/AnalysisBinding）与每个分析的
+  │  save 探针 + 隐式探针依赖（plan.rs）
   │  circuit-backend::thevenin::TheveninBackend
-  │  内存中的结构映射（不生成任何源文本）；按名选 plot、探针子集化、电阻电流推导
+  │  内存中的结构映射（不生成任何源文本）；按名选 plot、探针子集化（save + 隐式依赖）、
+  │  电阻电流推导；数据集名 = 分析标识 {kind}{ordinal}
   ▼
 cirq_ir::Circuit（每个分析任务单独构造，只含一个 Analysis）
   │  thevenin::circuit::{simulate_op, simulate_dc, simulate_ac, simulate_tran}
@@ -55,7 +58,10 @@ SimResult / SimPlot / SimVector
   │  轴构造 + 单位/复数类型转换（thevenin_types::Complex → circuit_results::Complex）
   ▼
 circuit_results::Dataset（axis + signals + 单位 + backend 元数据）
-  │  measure / to_csv / to_json
+  │  expr::from_ir 降级 + expr::eval：在原始网格上求值 derive，把派生列追加进数据集
+  │  measure::reduce：在原始网格上归约，Measured 记录值取自哪个分析
+  │  输出视图：导出信号 + 派生列；有 output_interval: 时重采样（resample）
+  │  to_csv / to_json
   ▼
 cdsl run 的 stdout 摘要与结果文件
 ```
@@ -76,6 +82,12 @@ cdsl run 的 stdout 摘要与结果文件
 
 - `core <- results`：`Dataset`/`Signal` 用 `Dimension` 标注单位，用 `Diagnostic` 报错，
   用 `Limits` 约束结果规模（`crates/circuit-results/src/lib.rs`）。
+- `core <- results` 在本轮多了一条**表达式的**边界：结果表达式的**计划层 IR**
+  （`ExprIr` / `ProbeRef` / `AnalysisBinding` / `DeriveRequest` / `MeasureRequest`）在
+  `circuit-core::plan`，**运行期 AST 与求值器**在 `circuit-results::expr`；两者之间只有
+  `expr::from_ir` 这一次显式降级，所以 `circuit-core` 仍然不依赖 `circuit-results`，
+  而分析计划可以脱离求值器被打印、检查与单测（`plan.rs` 的 `ExprIr` 方法与
+  `crates/circuit-cli/src/check.rs` 的 JSON）。
 - `results <- backend`：适配层把引擎自己的 `SimPlot`/`SimVector`/`Complex` 转换成中立的
   `Dataset`，这个转换点就是两条边存在的理由（`crates/circuit-backend/src/thevenin.rs`）。
 - `backend <- cli`：只有 CLI 需要"真的跑仿真"；`cdsl check` 走到后端只做能力校验
@@ -101,7 +113,9 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
   `Diagnostics` / 稳定的 `Code`）、`units`（`Dimension`、`Quantity`、单位后缀解析）、
   `id`（`NodeId` / `DeviceId` / `ModelId` / `AnalysisId` / `CircuitId`，`GROUND`）、
   `ir`（`Circuit` / `Device` / `Node` / `Model` / `SourceSpec` / `Waveform`）、
-  `plan`（`AnalysisPlan` / `AnalysisTask` / `Probe` / `Sweep` / 各分析规格）、
+  `plan`（`AnalysisPlan` / `AnalysisTask` / `Probe` / `Sweep` / 各分析规格，以及结果表达式的
+  计划层 IR：`ExprIr` / `ProbeRef` / `AnalysisBinding` / `DeriveRequest` / `MeasureRequest`；
+  `AnalysisTask` 同时带 `probes`（用户 `save` 的）与 `implicit_probes`（表达式依赖））、
   `limits`（`Limits`）。
 - **不拥有**：词法/语法（`dsl`）、结果语义（`results`）、求解（`backend`）、
   CLI 的输出与退出码策略（`cli`）。
@@ -111,15 +125,26 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
 ### `circuit-dsl`
 
 - **拥有**：`lexer`（含量纲字面量的词法）、`parser`（递归下降，语句关键字按文本分派；
-  `parse` 是文件入口，`parse_input` 是 REPL 的单条输入入口）、`ast`（语法树，名字是
+  `parse` 是文件入口，`parse_input` 是 REPL 的单条输入入口；表达式按
+  `MAX_EXPR_DEPTH` 做嵌套与形态双护栏）、`ast`（语法树，名字是
   字符串、每个表达式带 span）、`eval`（表达式求值器，**唯一**一套值语义，见下）、
-  `complete`（多行输入的三态判定）、`elaborate`
-  （名字解析、量纲检查、参数求值、层次展开、循环与条件展开、分析计划构造）。
+  `complete`（多行输入的三态判定）、`param_graph`（参数依赖图：一个 body 的节点/边、
+  确定性拓扑序、环报告、拓扑使用点的反向闭包）、`elaborate`
+  （名字解析、量纲检查、参数 DAG 求值、层次展开、循环与条件展开、分析计划构造、
+  结果表达式降级成 `ExprIr`、分析绑定解析、隐式探针依赖收集、结果重名检查与
+  check 期拓扑参数扫描拒绝）。
 - **不拥有**：任何仿真、文件访问或网络访问。整个 crate 是纯函数式的
   （`crates/circuit-dsl/src/lib.rs`）；DSL 不参与仿真过程，展开完成后拓扑固定。
 - **公开入口**：`lex`、`parse`、`parse_input`、`assess`、`compile`（整个文件的全部
   circuit 与 experiment）、`elaborate_experiment`（单实验 + 覆盖值，参数扫描每点调用它）、
   `Elaborated`、`Compiled`、`Program`。`circuit_parameters` 已定义但当前没有任何调用方。
+
+**结果表达式在展开期定型**：`derive` 与 `measure` 先按源码顺序收集（`RawDerive` /
+`RawMeasure`），等实验的**全部**分析任务登记完之后才解析 `analysis: :ac2` 这类标识——
+这正是"一个分析可以省略绑定、多个分析必须写明"得以实现的原因；同一步还完成静态量纲检查
+（`ExprIr::static_dimension_error`）、`avg`/`rms` 需要时间轴、AC 上 `max`/`min` 需要
+`abs(...)`、以及 `derive` 与 `measure` 共用命名空间的重名检查（`claim_result_name`；
+`save` 的信号名带探针形式，与派生名不可能相撞，见 `docs/language.md` §7.3）。
 - **共享求值器（`src/eval.rs`）**：`eval::eval(&Expr, &dyn Variables)` 是文件模式与
   REPL 共用的表达式语义——量纲传播、比较、短路、内置函数、拼接规则都在这里。
   名字查找走 `Variables` trait：展开器传自己的参数作用域（并借此汇报"参数在此声明"
@@ -132,6 +157,9 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
 - **拥有**：`backend`（`SimulationBackend` trait、`BackendCapabilities`、
   `classify_backend_failure` / `backend_failure`）、`thevenin`（唯一的实现，
   结构映射 + 结果物化）、`sweep`（参数扫描驱动 + 拓扑不变性检查）。
+  `convert_plot` 物化的是 `task.read_probes()`（`save` 探针 + 表达式依赖），
+  导出集合仍由 `task.probes` 决定；数据集的名字与 `analysis` 字段是
+  `{kind}{ordinal}`，也就是 `docs/language.md` §7.4 的分析标识。
 - **不拥有**：结果数据模型。`Dataset`、`Signal`、`Axis` 都在 `circuit-results`；
   适配层只负责把引擎输出搬进这些类型。
 - **公开入口**：`TheveninBackend::{new, with_limits, capabilities, validate, run}`、
@@ -143,21 +171,29 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
 ### `circuit-results`
 
 - **拥有**：`dataset`（`Dataset` / `Axis` / `Signal` / `Data` / `Complex` /
-  `BackendInfo` / `normalize_signal_name`）、`expr`（结果表达式 AST 与求值器，
-  作用在整个采样向量上）、`measure`（`max` / `min` / `avg` / `rms`）、
+  `BackendInfo` / `normalize_signal_name`）、`expr`（结果表达式 AST、求值器与
+  `from_ir` 降级，作用在整个采样向量上；`EvalSite`/`eval_at` 把 `derive`/`measure`
+  名字带进诊断，`is_constant`/`eval_constant` 供 check 期常量判定；每个运算节点校验
+  自己产出的样本有限性，`sqrt` 定义域、精确零分母、`gain_db` 零幅值是确定性错误，
+  乘除走受检量纲，求值前还有一道深度护栏）、
+  `measure`（`max` / `min` / `avg` / `rms`，`Measured` 记录值、单位与来源分析标识）、
   `export`（CSV/JSON、`SCHEMA = "circuit-dsl.result/1"`、非有限值警告）、
   `format_number`。
 - **不拥有**：后端类型（`thevenin_types` 只在 `circuit-backend` 出现）、
   仿真调度、CLI 输出。
 - **公开入口**：上列类型与 `measure` / `measure_signal` / `reduce` / `to_csv` /
-  `to_json` / `to_json_value` / `non_finite_diagnostics` / `eval`。
+  `to_json` / `to_json_value` / `non_finite_diagnostics` / `eval` / `expr::from_ir` /
+  `Measured::{render, render_with_analysis, with_analysis}`。
 
 ### `circuit-cli`
 
 - **拥有**：`cdsl` 二进制、四个子命令（`check`、`run`、`repl`、`capabilities`）、
   退出码（0 成功 / 1 用户错误 / 2 内部错误）、"诊断走 stderr、数据与摘要走 stdout"、
   结果文件命名与"拒绝写回输入文件"（`guard_output`）、终端层（提示符、行编辑、
-  历史、补全，`repl.rs`）。
+  历史、补全，`repl.rs`）。`check` 还会用与运行期同一个求值器算出**常量**结果表达式
+  （`check_constant_expressions`），所以 `sqrt(-1)` 这类非法常量在 check 阶段就是
+  exit 1。`main` 把每条子命令都放到 **64 MiB 栈**的工作线程上（`WORK_STACK_BYTES`），
+  与 `MAX_EXPR_DEPTH` 配对：被接受的表达式深度在 debug 构建里也不会耗尽栈。
 - **不拥有**：语言语义、仿真细节、结果格式定义、会话状态与执行流程（都在
   `circuit-session`）。`run.rs` 现在只负责文件 I/O、写出与摘要打印。
 - **产物入口**：`cdsl` 可执行文件（`check` / `run` / `repl` / `capabilities`）。
@@ -170,6 +206,9 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
 - **拥有**：会话的定义集合与会话变量、定义替换的原子性规则、`:load` / `:run` /
   `:list` / `:reset` / `:help` 的行为、REPL 的值显示格式（`format.rs`）、
   以及实验执行 `execute`（单次 / 参数扫描 / 测量求值 / 结果写出）。
+  `execute` 的顺序是：后端求解 → 在**原始**网格上追加派生信号（`attach_derived`）→
+  求值测量 → 组装输出视图 → 必要时重采样；参数扫描里绑定到非扫描分析的语句在**求解前**
+  被拒（`check_sweep_bindings`，`E_UNSUPPORTED`）。
 - **不拥有**：终端交互（在 `circuit-cli/src/repl.rs`），语言语义（在 `circuit-dsl`）。
 - **为什么不放进 CLI**：这样会话行为可以在没有 TTY 的情况下测试，且文件模式与
   REPL 共用同一条执行路径——两套实现迟早会对同一个实验给出不同答案。
@@ -204,7 +243,11 @@ expected 与 received（`E_DIMENSION` 的 `= expected: ohm` / `= received: s`）
 `units.rs` 的测试（`addition_requires_matching_dimensions`、
 `dimensionless_is_required_explicitly`）与 `docs/language.md` §8 的示例覆盖的是同一个行为。
 `Dimension` 只有 (volt, amp, second) 三个指数——刻意不建模长度、温度等，因为支持的
-器件不需要它们（`units.rs` 模块注释）。
+器件不需要它们（`units.rs` 模块注释）。指数的类型是 `i8`（`MIN_EXPONENT = -128`、
+`MAX_EXPONENT = 127`），`Dimension`/`Quantity` 的 `*` `/` 只提供
+`checked_mul` / `checked_div`（`Quantity` 不再实现 `Mul`/`Div` 运算符），
+调用点必须把 `None` 变成 `E_DIMENSION`：这就是 128 个电压因子在 debug 不 panic、
+release 不回绕的原因（R4-02）。
 
 **IR 里没有矩阵槽位，也没有后端句柄。** 三个可见的好处：（1）后端替换不改前端——
 适配层在 `cirq_ir::Circuit` 构造时重新分配 id（`nets` 用同一套稠密索引，元素 id 直接映射），
@@ -225,27 +268,44 @@ IR 的字段就是对外契约。
 但 `run_body` 在一个 body 内遇到第一个结构性错误就停止，避免用已经坏掉的 scope 继续
 产生噪声。
 
-### 4.1 参数与覆盖顺序
+### 4.1 参数 DAG 与覆盖顺序
 
-- `param` 只能在 body 内声明，**按出现顺序求值**，因此只能引用**之前**声明的参数。
-  这使依赖环在结构上不可能出现：`eval` 只读 `scope.vars`，而 `vars` 里只会有已声明的
-  参数和预装的覆盖值。自引用与前置引用都会在读取时报 `E_NAME`
-  （`crates/circuit-dsl/tests/elaborate.rs` 的 `a_self_referential_parameter_is_rejected`、
-  `a_forward_parameter_reference_is_rejected`）。
-  `Code::ParamCycle`（`E_PARAM_CYCLE`）在枚举里保留，但**当前没有任何代码会构造它**——
-  这正是"环不可能出现"的结果，`docs/language.md` §4.2 仍写着会报 `E_PARAM_CYCLE`，
-  与实现不一致。
-- 覆盖顺序是 **默认值 → 实例或实验覆盖 → 扫描点覆盖**，实现方式是
-  `Scope::vars` 在 body 执行**之前**就被覆盖链填好；`param` 语句里的 `default:` 只有在
-  `vars` 里还没有该名字时才写入（`stmt_param`）。因此 `param :r, default: 1.kohm`
-  配合实例覆盖 `r: 2.kohm` 得到 2 kΩ，且默认值仍会被记入 `scope.defaults`，
-  用于检查覆盖值的量纲。
+- `param` 只能在 body 内声明。一个 body 的声明先由**预扫描**整体收集，交给
+  `param_graph`（`crates/circuit-dsl/src/param_graph.rs`）建成依赖图：节点是
+  **一个 body 实例里的一个参数**（`ScopePath` + 名字，`top`、`top.stage1`…），
+  边是"这个默认值的有效定义读了那个参数"。求值按**确定性拓扑序**：依赖先算，平局按
+  声明顺序打破，所以同一个输入永远展开成同一个结果。
+- **前向引用合法**：`param :b, default: 2 * a` 写在 `param :a` 之前也能解析
+  （`docs/language.md` §4.2 有可运行例子）。自引用与多节点环报 `E_PARAM_CYCLE`，
+  消息含闭合路径（`a -> a`、`a -> b -> a`），主标签落在闭合的引用处，每个参与声明的
+  `param` 行各带一个次标签；未知名字仍是 `E_NAME`，图只负责把两者分开
+  （`param_graph::BodyGraph::unknown_reads`）。
+- **边只在一个 body 内**：子电路默认值看不到父作用域；唯一的跨作用域通道是实例的
+  `params: { .. }`——值在父作用域求值，并成为实例内同名参数的有效定义
+  （`DesignGraph::bind_from_parent`）。因此同名参数在不同实例里是两个节点，
+  扫描 `top.r` 不会牵连 `top.stage1.r`，除非 `params:` 真的把它们连起来。
+- 覆盖顺序是 **默认值 → 实例 `params:` → 实验 `param:` → 扫描点 →
+  REPL `:run name=expr`**（后者胜出），实现方式不变：`Scope::vars` 在 body 执行**之前**
+  就被覆盖链填好，`param` 语句里的 `default:` 只有在 `vars` 里还没有该名字时才写入
+  （`stmt_param`）。被覆盖的参数**不产生边、也不求值它的默认值**——有效定义先选出，
+  再建图。默认值仍会被记入 `scope.defaults`，用于检查覆盖值的量纲：`param :r, default:
+  1.kohm` 配合实例覆盖 `r: 2.kohm` 得到 2 kΩ。`cdsl check` 仍然按每个顶层电路自己的
+  默认值单独展开一遍（`compile()` 用空覆盖链），所以默认值本身写错、只被实验覆盖的电路
+  仍会在 `check` 阶段报 `E_NAME`（契约 §4.3 记录的边界）。
 - 实例覆盖写在**外层 scope** 里求值，所以 `params: { r: rstage }` 可以引用父电路的参数；
   子电路自己的默认值作为兜底折入 `eval_scope`，且每个被接受的覆盖值立即加入
   `eval_scope`，于是后面的条目可以引用前面的（`stmt_instance` 中的注释与代码）。
 - 实验级 `param :x, value: …` 只在"更早的实验级覆盖"构成的 scope 里求值，
   看不到电路参数（`experiment_overrides`）。`elaborate_experiment` 收到的扫描覆盖值
   按名字替换实验自身的覆盖值——"后者胜出"，这就是覆盖链最后一环。
+- **拓扑使用点与 check 期拒绝**：`if` 条件、`for` 的迭代源、生成名称与端子都会向
+  `DesignGraph` 记一个使用点（`note_use`）；从使用点沿依赖图**反向闭包**得到拓扑参数
+  集合。实验声明 `dc param: :n` 时，`check_swept_parameter` 在展开期就报
+  `E_TOPO_PARAM`，诊断带 `被扫描参数 -> 中间参数 -> 使用点` 路径与每一步的 span
+  （`topology_diagnostic`）。实验计划是在 `compile()` 里构造的，所以 `cdsl check`、
+  `cdsl run` 与 REPL 的 `:load` 都在任何求解之前拒绝它；`circuit-backend/src/sweep.rs`
+  的**逐点**拓扑比较原样保留，是第二道防线而不是替代品。只到达数值位置
+  （`value:`、`dc:`、`ac:`、`waveform:`、模型参数）的参数不受影响，普通数值扫描照常可用。
 
 ### 4.2 子电路、层次与端口
 
@@ -285,9 +345,15 @@ IR 的字段就是对外契约。
 `elaborate_experiment` 把 `op` / `dc` / `ac` / `tran` 变成 `AnalysisTask`，
 `save` 解析成 `NamedProbe`（`Probe::NodeVoltage` / `DifferentialVoltage` / `DeviceCurrent`，
 节点与器件在展开期就解析成 `NodeId` / `DeviceId`，后端永远看不到用户写的名字），
-`measure` 解析成 `MeasureRequest`。一个 `save` 作用于该实验的**所有**分析任务
-（`task.probes = probes.clone()`），重复保存同一探针报 `E_DUPLICATE`。
+`measure` 与 `derive` 分别解析成 `MeasureRequest` / `DeriveRequest`。一个 `save` 作用于该实验的
+**所有**分析任务（`task.probes = probes.clone()`），重复保存同一探针报 `E_DUPLICATE`。
 没有任何分析语句的实验报 `E_ARGUMENT`。
+
+本轮的顺序在这一层变得重要：`derive` 与 `measure` 先按源码顺序收集，**任务列表全部建好之后**
+才解析绑定（`analysis: :ac2` 只有在第二个 `ac` 已登记时才有意义），随后把表达式依赖写进对应任务的
+`implicit_probes`。绑定规则见 `docs/language.md` §7.4：显式 `analysis:` 必须命中；
+只有一个分析时可以省略；多个分析省略报 `E_AMBIGUOUS`；只有「裸探针且没写 `analysis:`」的
+`measure` 保留 legacy 的 tran > ac > dc > op 选取顺序（`AnalysisBinding::LegacyPreferred`）。
 
 ## 5. 后端适配
 
@@ -318,7 +384,7 @@ IR 的字段就是对外契约。
   `.max(tstep)` 夹取（`waveform.rs:37-38`）不会落在声明值上；声明边沿无法执行时在 `validate`
   阶段报能力错误（`E_UNSUPPORTED` / `E_LIMIT`），**绝不静默展宽边沿**。
 
-因此 `circuit-session` 的 `RunOutcome` 有**两份**瞬态数据：`datasets` 是原始求解网格（测量来源），
+`circuit-session` 的 `RunOutcome` 有**两份**瞬态数据：`datasets` 是原始求解网格（测量来源），
 `output_datasets` 是重采样后的展示/导出视图（无 `output_interval` 时两者相同）。
 `avg`/`rms`/`max`/`min` 只在原始网格上计算，改输出采样不影响测量。
 
@@ -328,7 +394,7 @@ IR 的字段就是对外契约。
 | 引擎行为 | 适配层的补偿 | 为什么必须补偿 | 测试位置 |
 |---|---|---|---|
 | `simulate_tran` 返回 `[op1, tran1]`，瞬态数据不在 `plots[0]` | `select_plot` 按小写名称前缀（`op`/`dc`/`ac`/`tran`）选 plot | 取 `plots[0]` 会静默返回工作点 | `tests/adapter.rs::rc_transient_matches_analytic`（若选错，轴不是时间轴，测试会以 "expected a time axis" 失败） |
-| 单分析入口**忽略** `circuit.save` | `build_circuit` 把 `save` 留空；`convert_plot` 只按 `task.probes` 物化信号 | 否则一次只要一个探针的运行会返回引擎的全部内部向量 | `tests/adapter.rs::only_requested_probes_are_returned`（断言信号名恰为 `["v(mid)"]`） |
+| 单分析入口**忽略** `circuit.save` | `build_circuit` 把 `save` 留空；`convert_plot` 只按 `task.read_probes()`（`save` + 表达式依赖）物化信号，导出集合仍由 `task.probes` 决定 | 否则一次只要一个探针的运行会返回引擎的全部内部向量 | `tests/adapter.rs::only_requested_probes_are_returned`（断言信号名恰为 `["v(mid)"]`） |
 | 两处相位单位相反：`AcSpec.phase` 与 `sin` 的 `phi` 在引擎里都是**度**，本项目内部都存弧度 | `map_source` 对两者都做 `to_degrees()`；反方向由 `elaborate` 的 `sin(..., phase:)` 分支做 `to_radians()` | 混用会让每个相量整体旋转 | **AC 源相位**：`tests/adapter.rs::ac_phase_is_converted_from_radians_to_degrees`（`phase_rad = π/2`，断言 `v(out) ≈ +0.5j`，实部 < 1e-9），本轮另加 `tests/phase_regression.rs` 覆盖多个非零角度、负相位与实/虚部。**`sin` 波形的 `phi`**：`tests/phase_regression.rs`（IR 直构）覆盖适配层换算；**DSL 层的 `sin(..., phase:)` 度→弧度换算此前在 `elaborate.rs` 与 `e2e.rs` 里都没有任何测试**（`grep -c phase crates/circuit-dsl/tests/elaborate.rs` = 0），本轮补 `crates/circuit-dsl/tests/phase_syntax_regression.rs`。**AC 源的相位目前没有 DSL 语法**（`elaborate.rs` 构造 `AcSpec { phase_rad: 0.0 }`），所以 AC 非零相位只能在 IR 层验证 |
 | `thevenin_types::Complex` 不是 `num_complex` | 在 `complex_of` / `make_signal` 边界转换成本项目自己的 `circuit_results::Complex` | `circuit-results` 不能依赖任何后端类型 | 间接覆盖：`rc_ac_matches_analytic`、`rlc_ac_matches_analytic`、`differential_probe_subtracts_complex_signals` 都在复数域比对解析解 |
 | 只有自带支路未知量的器件才有 `#branch` 电流（电压源、电感） | 电压源/电感直接读取；**电阻**用 `i = (v(p) - v(n)) / R` 推导；**电容、二极管、独立电流源**在 `validate` 阶段报 `E_UNSUPPORTED` 并说明原因 | brief 禁止伪造不可得的电流；推导只对线性电阻做，且必须被独立验证 | 推导：`divider_op_and_current_direction`（直流 KCL，`i(r1) = -i(v1)`，1e-12）、`derived_resistor_current_agrees_with_source_current_in_ac`（交流复数，相对误差 1e-9）；拒绝：`capacitor_current_is_refused_with_a_reason` |
@@ -362,7 +428,9 @@ IR 的字段就是对外契约。
   `output_interval` 指定的等间隔网格（起点/末点保留、线性插值、不越界外推、超
   `Limits::max_result_values` 报 `E_LIMIT`）。会话层同时返回原始与重采样两份数据，
   见 §5 的瞬态说明。
-- `diagnostics: Vec<Diagnostic>`：属于这个结果的警告（后端警告、导出警告）。
+- `diagnostics: Vec<Diagnostic>`：**数据集自己的**警告与来源信息（计划层、后端附加）。
+  渲染期的非有限值警告不写进这里，而是由 `write_datasets` 作为 `Written::warnings`
+  返回并打印（见下），JSON 文件里保留的仍然只是这个数组。
 - `Dataset::validate` 强制形状规则：每个信号的样本数必须等于轴长（或有轴时为 1）、
   信号名（大小写与空白不敏感地归一后）不得重复、标量值总数不得超过
   `Limits::max_result_values`（复数样本计 2）。校验失败是错误，**绝不截断或补零**。
@@ -378,6 +446,15 @@ IR 的字段就是对外契约。
   两种情况都为受影响的信号（以及轴）产生一条 `warning[E_VALUE]`，说明有几个非有限样本、
   索引在哪、以及"导出为空字段/`null`"。数值因此是"缺失且可见"，而不是静默变成一个
   貌似合理的数字。复数的两个分量独立处理：一个分量为 inf 时另一个仍然保留。
+- **两批诊断是互补的，不是同一批**（契约 §1.4 修正后的说法）：JSON 文件里的
+  `diagnostics` 数组是**数据集自己的**来源诊断（计划层与后端附加，`to_json_value`）；
+  而 `Written::warnings` 是**渲染期**的 `non_finite_diagnostics`——每个非有限样本一条，
+  文件本身只把它表达为空字段或 `null`。两者互不拷贝，返回的警告按
+  `render_plain()` 文本**按数据集去重**，所以 CSV+JSON 两种格式只报一次。
+  `cdsl run` 与 REPL 先显示 `RunOutcome::warnings`（数据集级）再显示
+  `Written::warnings`（渲染级），看到的才是完整画面。会话层的 `write_datasets` 就按这个
+  关系接线：用 `to_*_with_diagnostics` 渲染、按数据集去重、再写文件，并返回
+  `Written { paths, warnings }`；CLI 与 REPL 共用 `warning_lines()` 打印（R4-03）。
 
 `avg` / `rms` **按时间积分**，不是样本算术平均：`avg = ∫x dt / ∫dt`、
 `rms = sqrt(∫x² dt / ∫dt)`，用梯形法在**非均匀**时间轴上积分（`measure.rs`）。
@@ -388,15 +465,32 @@ IR 的字段就是对外契约。
 `max` / `min` 是样本极值，不需要轴，实信号不取绝对值（负的极值是合法的，
 需要模长请用 `abs`）。
 
-`expr.rs` 提供作用在采样向量上的结果表达式求值器（`v(a)`、`v(a,b)`、`i(r1)`、
-`abs`、`sqrt`、`min`、`max`、`20*log10(abs(a/b))` 形式的增益），实数/复数混合时提升为复数。
-**注意**：这个求值器目前是库能力，CLI 的 `measure` 只按探针名取信号后直接归约
-（`run.rs` 只 import 了 `measure_signal`），DSL 不能写任意结果表达式。
-`docs/language.md` §7 描述的 `measure :name, max: v(:out)` 形式是当前唯一接通的形式。
+`expr.rs` 既提供作用在采样向量上的结果表达式求值器（`v(a)`、`v(a,b)`、`i(r1)`、
+`abs`、`sqrt`、`min`、`max`、`20*log10(abs(a/b))` 形式的增益），也提供 `from_ir`：
+把 `circuit-core::plan::ExprIr` 降级成这个运行期 AST。实数/复数混合时提升为复数。
+**本轮已接通**：DSL 的 `derive` 与表达式形式的 `measure` 都走这条路径——前端降级成 `ExprIr`，
+会话层（`execute.rs::attach_derived` / `evaluate_measures_with`）在**原始**数据集上调用
+`circuit_results::expr::eval` 与 `measure::reduce`。求值失败不再"换下一个分析再试"，
+而是整次运行失败，并把分析标识与表达式的规范形式（`ExprIr::render`，不是逐字源文本）放进诊断 context。
+`docs/language.md` §7.1 描述的 `measure :name, max: v(:out)` 形式仍然有效，并保留它自己的
+legacy 选取顺序（见下一段）。
+
+**R4-01 的不变量**（同一文件，全部实现在一个求值器里）：每个运算节点产出样本后立刻校验
+有限性——实数 `x.is_finite()`、复数要求两个分量都有限，失败就是命名该运算与子表达式的
+`E_VALUE`；因此 `min(sqrt(-1), 2)` 在 `sqrt` 处失败、`1e308*1e308` 不会让 `inf` 继续
+参与计算。`sqrt` 负实数是错误、分母精确为 0 是错误、`gain_db` 零幅值是错误，**没有
+epsilon、没有饱和、没有跳过样本、没有 `catch_unwind`**；输入信号本身是 NaN/±inf 也由
+读取它的运算拒绝。诊断带 `analysis`/`kind`/`signal`/`sample`/`index` 上下文，具名站点
+（`derive`/`measure`）还会把名字写进消息并以名字替换 `signal`；标量分析说明没有轴坐标。
+`check` 对**常量**表达式（`is_constant`）调用同一个求值器，所以同一批错误不用等到运行
+（见 §2 的 `circuit-cli`）。求值前还有一道显式深度护栏：深度超过
+`circuit_core::limits::MAX_EXPR_DEPTH`（256）报 `E_LIMIT`，且不渲染那个深层子表达式。
 
 CLI 侧还有一个取值规则：一个实验可以跑多个分析，`measure` 会从**能支持该归约的最丰富
-分析**里取数，顺序是 tran → ac → dc → op（`run.rs::measurement_rank`）。没有这个顺序，
-RC 阶跃上的 `max: v(:out)` 会静默读到工作点的 0 V 而不是瞬态峰值。
+分析**里取数，顺序是 tran → ac → dc → op（`crates/circuit-session/src/execute.rs::measurement_rank`）。
+这条规则只适用于 legacy 形式——目标是裸探针、且没写 `analysis:` 的 `measure`；
+写了 `analysis:` 或目标是表达式时绑定是确定的，选中分析上的求值失败就是错误，不会跳到下一个。
+没有这个顺序，RC 阶跃上的 `max: v(:out)` 会静默读到工作点的 0 V 而不是瞬态峰值。
 
 ## 7. 参数扫描
 
@@ -406,14 +500,16 @@ RC 阶跃上的 `max: v(:out)` 会静默读到工作点的 0 V 而不是瞬态�
 
 因此：
 
-1. `cdsl run` 在 `run.rs::parameter_sweep_of` 检出"唯一的 DC 任务且目标是参数"，
+1. `cdsl run` 的执行器 `circuit-session::execute::parameter_sweep_of` 检出"唯一的 DC 任务且目标是参数"，
    生成坐标（`sweep_coordinates`，端点规则：`stop` 只在落在步长整数倍上时包含；
-   方向与步长符号必须一致；步长为 0 报 `E_SWEEP`）。
+   方向与步长符号必须一致；步长为 0 报 `E_SWEEP`）。在**任何求解之前**，
+   `check_sweep_bindings` 拒绝绑到非扫描分析的 `derive`/`measure`：整个扫描只产出一个
+   拼接数据集，所以这是 `E_UNSUPPORTED`，而不是静默丢弃（`docs/language.md` §7.4）。
 2. 每个坐标调用一次 `circuit_dsl::elaborate_experiment`，覆盖值形如
    `[(name, Quantity::new(value, sweep.dimension))]`——每次都是**全新展开**，
    所以 `save`、拓扑、参数求值全部按该点的值重新计算。
-   为此 `run.rs` 重新 lex/parse 了一次源文件：`check::FrontEnd` 只保留 `Compiled`，
-   而 `elaborate_experiment` 需要 `Program`。
+   展开用的是 `check::front_end` 一并返回的 `Program`（`crates/circuit-cli/src/check.rs` 的
+   `FrontEnd::program`），所以扫描路径不再二次读盘解析。
 3. 单点运行把该 DC 任务改成 `AnalysisKind::Op`（`as_single_point_plan`），
    因为一个扫描点就是一个工作点。
 4. `run_parameter_sweep` 在每个点展开后做**拓扑不变性检查**：
@@ -424,6 +520,9 @@ RC 阶跃上的 `max: v(:out)` 会静默读到工作点的 0 V 而不是瞬态�
    器件名、器件种类或连线有差异，就报 `E_TOPO_PARAM`，并说明"参考拓扑来自哪个点、
    差异是什么"。这把"拓扑参数"从一个需要用户相信的标签变成了被真正检查的性质
    （`docs/language.md` §4.2 的规则）。
+   这条检查现在是**第二道**防线：拓扑参数扫描已经在 `compile()` 的展开期被
+   `E_TOPO_PARAM` 拒绝（§4.1），所以 `cdsl check` 不必求解就能报出来，
+   而运行期逐点比较仍然保留，防住任何静态分析没覆盖到的变化。
 5. 任一点失败立即停止并报告（不继续产生部分结果）。
 6. `stitch` 把各点结果拼成一个 `Dataset`：轴是 `Axis::Parameter`，
    分析名是 `dc_param_<参数名>`（于是结果是 `sweep.dc_param_r.csv`），
@@ -450,11 +549,14 @@ RC 阶跃上的 `max: v(:out)` 会静默读到工作点的 0 V 而不是瞬态�
   `SourceSpan::synthetic()`（循环生成的实体、构造出来的 IR）不会伪装成一个位置，
   诊断改用"命名所在定义"的方式说明。
 - `Code` 的 `E_*` 字符串是 CLI 契约的一部分，注释明确写了"发布后不得改名"：
-  `E_SYNTAX`、`E_NAME`、`E_DUPLICATE`、`E_DIMENSION`、`E_VALUE`、`E_ARGUMENT`、
+  `E_SYNTAX`、`E_NAME`、`E_DUPLICATE`、`E_AMBIGUOUS`、`E_DIMENSION`、`E_VALUE`、`E_ARGUMENT`、
   `E_TYPE`、`E_PARAM_CYCLE`、`E_RECURSION`、`E_PORT`、`E_TOPO_PARAM`、`E_LIMIT`、
   `E_UNSUPPORTED`、`E_BACKEND`、`E_CONVERGE`、`E_SINGULAR`、`E_SWEEP`、`E_IO`。
-  其中 `E_PARAM_CYCLE` 当前不可达（§4.1），`E_CONVERGE` / `E_SINGULAR` 只在
-  后端失败分类里产生。
+  其中 `E_PARAM_CYCLE` 由参数依赖图的环报告产生（§4.1），`E_TOPO_PARAM` 既来自
+  展开期的拓扑参数扫描拒绝（§4.1）也来自后端逐点拓扑比较（§7），`E_LIMIT` 还覆盖
+  表达式深度上限（`MAX_EXPR_DEPTH`），`E_CONVERGE` / `E_SINGULAR` 只在后端失败
+  分类里产生，`E_AMBIGUOUS` 由结果表达式的绑定解析产生（多分析实验里没写
+  `analysis:`，`docs/language.md` §7.4）。
 - **失败不会被伪装成一次空成功**，具体在三处兜底：
   `SimulationBackend::run` 的契约要求"报告失败，而不是返回空但成功的结果"；
   `convert_plot` 遇到"后端没有报告这个探针"或"没有该分析对应的 plot"就报错，
@@ -477,4 +579,10 @@ RC 阶跃上的 `max: v(:out)` 会静默读到工作点的 0 V 而不是瞬态�
 | `Dataset::validate` 拒绝超限结果 | 截断到上限 | 结果文件必须要么完整要么报错 |
 | `circuit-core` 不派生 serde，`check --json` 手写 | 给 IR 加 serde 派生 | 让 IR 不绑定一种序列化选择（`check.rs` 注释） |
 | `uic` 不暴露 | 直接透传 `TranSpec.uic` | 后端路径未经 Phase-0 验证，未验证的能力不开放（`plan.rs` 注释、`docs/language.md` §10） |
+| 结果表达式的计划层 IR 在 `circuit-core`，降级与求值在 `circuit-results` | 把求值器放进 `core`，或让前端把 AST 直接交给后端 | `core` 必须与求解器和结果层无关；`expr::from_ir` 是两条边唯一的接触点，计划因此可被 `check` 打印、检查与单测 |
+| 派生信号在原始网格上求值，重采样放在最后 | 先重采样再求值 | `v*v` 这类非线性表达式在插值点上的值会被改变；测量与派生必须看到求解器真正给出的样本（`docs/language.md` §7.6） |
+| 参数依赖图：预扫描 + 确定性拓扑序，环报 `E_PARAM_CYCLE` | 继续按声明顺序求值、前向引用报 `E_NAME` | 前向引用是自然写法；依赖顺序由数据决定而不是书写位置，平局按声明顺序打破保持可复现；环被定位到参与声明而不是伪装成"未声明"（`param_graph.rs`） |
+| 每个运算节点校验自身样本的有限性 | 只在表达式末尾检查，或让 NaN/inf 传播 | 中间值非法时 `min`/`max` 之类的组合会把它掩盖成一个看似合法的结果（R4-01）；逐节点校验才能把错误指到真正产生它的运算 |
+| 量纲指数溢出报 `E_DIMENSION`（受检算术） | debug panic / release 回绕，或把指数加宽 | 用户可达的长乘积链必须有一个诊断；加宽指数只是把边界推远，仍会有一个不可达的深度（R4-02、`units.rs`） |
+| 隐式探针只读不导出（写了 `save` 时） | 把表达式用到的信号自动加进导出列 | 导出集合是用户写下的契约；自动加列会让结果文件出现没写过的列，`check` 把它单列为 `reads ... (expression inputs, not exported)` |
 | 每个用例单独的容差 | 全局一个宽松阈值 | 线性解接近机器精度，瞬态受脉冲上升沿与求解器 `RELTOL` 限制；见 `docs/testing.md` §5 |

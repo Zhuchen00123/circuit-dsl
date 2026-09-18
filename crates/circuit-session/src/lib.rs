@@ -15,5 +15,7 @@ pub mod execute;
 pub mod format;
 pub mod session;
 
-pub use execute::{Format, RunOutcome, RunRequest, execute, write_datasets};
+pub use execute::{
+    Format, RunOutcome, RunRequest, evaluate_measures, execute, parameter_sweep_of, write_datasets,
+};
 pub use session::{Options, Reply, Session, completions};

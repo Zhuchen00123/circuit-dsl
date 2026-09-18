@@ -640,7 +640,6 @@ struct BpRow {
     /// `0` for the first period, then the pulse index.
     k: u64,
     kind: &'static str,
-    t_prev: f64,
     h_before: f64,
     h1: f64,
     /// `min(2*h_before, h_max) * 0.1` — the restart step the engine's rules
@@ -707,7 +706,6 @@ fn breakpoint_rows(
                 bp,
                 k,
                 kind,
-                t_prev: t[i],
                 h_before,
                 h1,
                 pred_h1,
@@ -802,7 +800,7 @@ fn run_all() -> i32 {
     let mut worst_residual = 0.0_f64;
     let mut worst_residual_at = 0.0_f64;
     let mut worst_input = 0.0_f64;
-    let mut check = |t: f64, worst_residual: &mut f64, worst_residual_at: &mut f64| {
+    let check = |t: f64, worst_residual: &mut f64, worst_residual_at: &mut f64| {
         let r = TAU * reference.dy(t) + reference.y(t) - reference.v_in(t);
         if r.abs() > *worst_residual {
             *worst_residual = r.abs();

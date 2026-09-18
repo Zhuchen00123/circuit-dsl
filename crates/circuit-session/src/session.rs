@@ -637,13 +637,12 @@ impl Session {
             lines.push(format!("  warning: {w}"));
         }
         for m in &outcome.measures {
-            // The session shows measures in the same engineering form as any
-            // other value, rather than the raw SI number a CSV field needs.
-            lines.push(format!(
-                "  measure {} = {}",
-                m.name,
-                circuit_core::format_quantity(Quantity::new(m.value, m.unit))
-            ));
+            // Rendered by the results layer so the REPL and a file run print
+            // the same text, including which analysis the value came from: in
+            // a multi-analysis experiment a name alone does not say what was
+            // measured. The run only reaches this point when every requested
+            // measure evaluated, so no measure can be missing from here.
+            lines.push(format!("  measure {}", m.render_with_analysis()));
         }
 
         if let Some(dir) = out {
@@ -651,9 +650,14 @@ impl Session {
                 execute::write_datasets(dir, Format::Both, &outcome.output_datasets, &mut |_| {
                     Ok(())
                 })?;
-            for path in written {
+            for path in &written.paths {
                 lines.push(format!("  wrote {}", path.display()));
             }
+            // What a file run prints for the same experiment, in the same
+            // words: the renderer warnings are built by warning_lines, so the
+            // REPL and the file run cannot disagree about what is missing from
+            // the file that was just written.
+            lines.extend(written.warning_lines());
         }
 
         Ok(Reply::Message(lines.join("\n")))

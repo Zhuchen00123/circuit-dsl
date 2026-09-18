@@ -2,6 +2,14 @@
 
 > 本文记录 `cdsl repl` 的设计与**实测行为**。文中的命令、输出与限制都来自真实
 > 运行；不能自动化验证的部分在 §8 单独列出。
+>
+> 第 3 轮补充：结果表达式（`derive` 与表达式形式的 `measure`）已经接入语言，
+> REPL 与文件模式继续共用同一条执行路径（§6）；§4.5 是实测会话，§10 里对应的那条
+> "后续方向"已经完成。
+>
+> 第 4 轮补充：参数在同一 body 内支持**前向引用**并按依赖顺序求值（环报
+> `E_PARAM_CYCLE`），拓扑参数扫描在 `:load`/定义实验时就被 `E_TOPO_PARAM` 拒绝，
+> 导出警告会出现在 `:run --out` 的回复里。全部是实测行为，见 §9。
 
 ## 1. 范围
 
@@ -213,6 +221,101 @@ error[E_SYNTAX]: `op` is a body statement, not a session input
 - 其余值：`:vin`、`"r1"`、`true`、`[1, 2]`、`{ a: 1 }`。
 - 超出前缀范围（`1e20 V`）退回指数形式。
 - 存储始终是 SI 全精度，只有显示做有效数字截断。
+- **例外：`:run` 的测量行**不走工程计数法。它由结果层统一渲染（`Measured::render_with_analysis`），
+  打印 SI 全精度数值、单位与分析标识，与 `cdsl run` 的同一条测量**逐字相同**，例如
+  `measure vfinal = 0.9932620899316276 V (tran1)`；变量、`:show` 等其它输出仍用上面的工程计数法。
+
+### 4.5 结果表达式与 `derive`
+
+第 3 轮的 `derive` 与表达式形式的 `measure` 在会话里与文件里写法完全相同，绑定规则、
+量纲检查与运行期错误也都一样（语言规范：`docs/language.md` §7）。下面是一段**真实运行**的
+管道会话（stdin 不是终端时输入不会回显，所以提示符后面直接跟着结果；终端模式只是多显示你敲的字符）。
+
+输入：
+
+```ruby
+circuit :rc do
+  param :r, default: 1.kohm
+  param :c, default: 100.nF
+  node :vin, :vout
+  voltage_source :input, p: :vin, n: :gnd, dc: 0.V, ac: 1.V
+  resistor :r1, p: :vin, n: :vout, value: r
+  capacitor :c1, p: :vout, n: :gnd, value: c
+end
+experiment :response, circuit: :rc do
+  ac from: 100.Hz, to: 1.kHz, points_per_decade: 10
+  derive :gain, expr: v(:vout) / v(:vin)
+  measure :peak, max: abs(v(:vout) / v(:vin))
+end
+:run response
+:quit
+```
+
+输出：
+
+```text
+cdsl> ....> ....> ....> ....> ....> ....> ....> ....> defined circuit `rc`
+cdsl> ....> ....> ....> ....> defined experiment `response`
+cdsl> experiment `response` (backend thevenin 0.5.0)
+  ac1: 11 frequency points; signals: v(vin), v(vout), i(input), gain
+  ac1 has 11 points; pass `--out <dir>` to write them
+  measure peak = 0.998031904503645 dimensionless (ac1)
+cdsl> 
+```
+
+要点：
+
+- 派生信号出现在 `:run` 的摘要里（`signals: ... gain`），和 `save` 的信号一样是这一分析的一列；
+  这行描述的是**输出视图**，所以点数与 `:run --out` 写出的文件一致。
+- 测量打印为 `measure <名字> = <值> <单位> (<分析标识>)`：`(ac1)` 说明这个值取自哪个分析——
+  多分析实验里光有名字说不清测的是什么（`crates/circuit-session/src/format.rs` 与结果层的
+  `Measured::render_with_analysis` 输出同一段文本）。
+- 这个实验没有 `save`，所以后端给出的信号（`v(vin)`、`v(vout)`、`i(input)`）连同派生的 `gain`
+  一起显示；表达式用到的探针由依赖规则自动读取，不需要先写 `save`。
+- 定义 `experiment` 时就做静态检查：多分析没写 `analysis:`、量纲不符、重名、把 `avg`/`rms`
+  **绑定**到没有时间轴的分析等都在这里被拒，会话保持原样（定义被原子地拒绝）。
+  legacy 形式（目标是裸探针、没写 `analysis:`）没有绑定，它的 `avg`/`rms` 适用性只能在
+  `:run` 时判断（§4.5 末的错误例子）。
+
+失败的输入不会改变会话，报告的就是文件模式的那段诊断：
+
+```text
+error[E_AMBIGUOUS]: `g` could be evaluated on any of 2 analyses, so this derive needs `analysis:`
+  --> <repl:11>:4:3
+   |
+4 |   derive :g, expr: v(:vout) / v(:vin)
+   |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = available analyses: ac1, op1
+   = add `analysis: :ac1` to choose one
+```
+
+运行期错误（这里是 `v(:vout)` 在 t = 0 恰好为 0 导致的除零）在 `:run` 时才报告，
+诊断里带分析与样本坐标，会话和它的定义都还在：
+
+```text
+error[E_VALUE]: division by zero in `(v(vin) / v(vout))` at time = 0 of analysis `tran1`: `v(vout)` is 0
+   = analysis: tran1
+   = kind: tran
+   = signal: v(vout)
+   = sample: time = 0
+   = index: 0
+   = analysis: tran1
+   = expression: (v(vin) / v(vout))
+   = no epsilon is applied: a zero denominator is reported, never evaluated to an infinity
+```
+
+**第 4 轮的表达式错误策略在会话里同样成立**：每个运算节点校验自己产出的样本有限性
+（实数 `is_finite()`、复数两个分量都有限），`sqrt` 的负样本、精确零分母、`gain_db`
+零幅值都是确定性错误，**没有 epsilon、没有饱和、没有跳过样本**，所以 `min(sqrt(-1), 2)`
+不能被外层的 `min` 掩盖（`docs/language.md` §7.2）。注意时机差异：REPL 定义实验时只做
+静态检查，**常量**表达式的非法值在 `:run` 时才报——实测定义 `derive :illegal, expr: sqrt(-1)`
+成功，`:run bad` 以 `E_VALUE` 失败；而在 `cdsl check` 里同一个表达式在检查阶段就被拒绝
+（错误文本相同，见 `docs/language.md` §7.7）。
+
+**管道模式**下任何失败的输入都会让 `cdsl repl` 以 1 退出（所以一段会话可以当脚本用；
+见 §4.2 与 `docs/language.md` §6），成功的会话以 0 退出。交互模式下错误只打印、不退出：
+按 Ctrl+D 或 `:quit` 离开，退出码只反映终端 I/O（`crates/circuit-cli/src/repl.rs` 的 `piped` 与
+`interactive`）。
 
 ## 5. 完备性判定：三态
 
@@ -259,6 +362,10 @@ pub fn assess(source: SourceId, text: &str) -> Completeness
 - `crates/circuit-dsl/src/eval.rs`（新）：表达式求值器，**唯一**一套值语义。
   名字查找走 `Variables` trait，展开器传入自己的参数作用域（带声明位置），
   会话传入变量表。`elaborate.rs` 的原有调用点通过一层薄包装保持不变。
+- `crates/circuit-dsl/src/param_graph.rs`（第 4 轮，新）：**参数依赖图**。节点是一个
+  body 实例里的参数（`ScopePath` + 名字），边是有效定义里的引用；提供确定性拓扑序、
+  环报告（`E_PARAM_CYCLE`）与拓扑使用点的反向闭包。`elaborate.rs` 的预扫描把图交给它，
+  于是 `compile()`——也就是会话的 `:load` 与定义实验——就能拒绝拓扑参数扫描。
 - `crates/circuit-dsl/src/complete.rs`（新）：§5 的三态判定。
 - `crates/circuit-dsl/src/parser.rs`：`=` 成为 token；新增 `parse_input` /
   `Parsed` / `Input`；`param` 位置与五处针对性提示。
@@ -276,6 +383,9 @@ pub fn assess(source: SourceId, text: &str) -> Completeness
   （顺带修掉了原来一次运行解析两遍的问题）。
 
 ## 7. 测试与验证
+
+（以下是第 2 轮结束时的数字；第 4 轮的计数、判据与新测试目标见 `docs/testing.md` §2
+与 `docs/review-evidence/round4/`。）
 
 实测：`cargo test --workspace` 共 **389 个测试全部通过**（0 失败）；
 `cargo nextest run --workspace` 报 388（nextest 不跑 doc-test）；
@@ -314,10 +424,78 @@ pub fn assess(source: SourceId, text: &str) -> Completeness
 也就是说：**会话行为**有测试，**按键到行为的最后一跳**没有。后者是 rustyline 的
 职责，本项目只负责把错误变体映射到正确的动作，那部分有测试。
 
-## 9. 后续设计方向（本轮不做）
+## 9. 第 4 轮补充（参数 DAG、拓扑扫描拒绝、导出警告）
+
+### 9.1 参数 DAG
+
+- 同一 body 内**前向引用合法**：`param :b, default: 2 * a` 可以写在 `param :a` 之前。
+  声明先被整体收集，再按依赖顺序（拓扑序）求值；书写顺序只用来打破平局，因此同一个
+  输入每次展开的结果相同。
+- **自引用与多节点环是 `E_PARAM_CYCLE`**（不再是 `E_NAME`）：诊断给出闭合路径
+  （`a -> a`、`a -> b -> a`）并定位每个参与声明的 `param` 行。引用根本未声明的名字
+  仍然是 `E_NAME`，两者不会混。环只在同一 body 内成立；两个实例里的同名参数是两个
+  独立节点，除非实例的 `params:` 真的把它们连起来。
+- **覆盖链不变**：默认值 → 实例 `params:` → 实验 `param:` → 扫描点 → `:run name=expr`。
+  被覆盖的参数不重新求值它的默认值；`:run` 的覆盖值仍在会话作用域求值一次，并在摘要里
+  打印 `override name = value`。改了基参数后，所有依赖它的参数一起重算（见 §9.3）。
+- **拓扑参数扫描在定义期就被拒绝**：`:load` / 定义实验（`compile`）阶段报
+  `E_TOPO_PARAM`，带 "被扫描参数 → 中间参数 → 使用点" 的路径；会话里不会留下这个实验，
+  之后的 `:run` 报 `E_NAME`。只改元件数值的扫描照常可用。
+- **失败不污染会话**：一次失败的 `:run`（含失败的覆盖）之后，下一次成功运行的输出与
+  失败前逐字符相同。
+
+### 9.2 导出警告
+
+`:run <exp> --out DIR` 写文件时，渲染期的非有限样本警告（CSV 空字段 / JSON `null`）
+会随回复打印，与文件模式的 `cdsl run` 共用同一条 `warning_lines()`；同一个数据集写
+CSV+JSON 只报一次。`<file>.json` 里的 `diagnostics` 数组是**数据集自己的**来源诊断，
+与这批渲染警告互补、不是同一批（`docs/language.md` §6 与 `docs/architecture.md` §6）。
+
+### 9.3 实测会话
+
+管道输入（stdin 不是终端时输入不回显）。电路里 `param :b, default: 2 * a` 写在
+`param :a` 之前：
+
+```text
+cdsl> defined circuit `chain`
+cdsl> defined experiment `div`
+cdsl> :run div
+experiment `div` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(out)
+  v(out) = 4 V
+cdsl> :run div a=2.kohm
+experiment `div` (backend thevenin 0.5.0)
+  override a = 2 kohm
+  op1: scalar; signals: v(out)
+  v(out) = 4.8 V
+cdsl> :run div a=3.kohm
+experiment `div` (backend thevenin 0.5.0)
+  override a = 3 kohm
+  op1: scalar; signals: v(out)
+  v(out) = 5.14286 V
+cdsl> :run div a=0.ohm
+error[E_VALUE]: `value` must be greater than zero, found the given value
+  --> <repl:1>:7:42
+   |
+ 7 |   resistor :r2, p: :out, n: :gnd, value: b
+   |                                          ^
+   = device: r2
+   = zero or negative R/L/C values are rejected rather than replaced by a small positive number
+cdsl> :run div
+experiment `div` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(out)
+  v(out) = 4 V
+```
+
+数值与手算一致：`v(out) = 6 V · b/(1 kΩ + b)`、`b = 2a`，所以 `a = 1 / 2 / 3 kΩ` 给出
+4 / 4.8 / 5.142857… V；`a = 0 Ω` 让 `b = 0`，展开期就报 `E_VALUE`（R/L/C 不接受零值），
+这次失败的覆盖没有改变会话，最后一条 `:run div` 回到 4 V。整段会话的实测退出码是 1
+（管道模式下有一次失败输入）；输入文件与原始日志在 `target/round4/docs-worker/`。
+
+## 10. 后续设计方向（本轮不做）
 
 - `:save <file>` 把当前定义写回 `.cdsl`（需要先决定注释与格式的保留策略）。
-- 结果表达式的 `measure` 语法接入（求值器 `circuit-results::expr` 已就绪）。
+- `derive` 互相引用、跨分析或跨轴的结果表达式（当前按设计拒绝，见 `docs/language.md` §7.8）。
 - AC 相位语法（IR 支持，语言无法表达）。
 - 受控源（VCVS/VCCS）与更多器件模型。
 - 若确有需要，为块引入局部值绑定——届时应让"设计参数"与"局部值"成为两个明确的

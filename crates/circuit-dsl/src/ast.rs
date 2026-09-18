@@ -260,13 +260,31 @@ pub enum ExpStmt {
         value: Expr,
         span: SourceSpan,
     },
-    /// `measure :name, max: v(:out)`
+    /// `measure :name, max: v(:out)`, optionally `max: <expr>, analysis: :ac1`.
     Measure {
         name: SpannedName,
         /// `max` / `min` / `avg` / `rms`
         kind: String,
         kind_span: SourceSpan,
         target: Expr,
+        /// `analysis: :ac1`: the analysis the target is evaluated on.
+        ///
+        /// `None` leaves the choice to elaboration: one analysis in the
+        /// experiment binds to it, several make the statement ambiguous, and a
+        /// lone probe read keeps the documented legacy search order.
+        analysis: Option<SpannedName>,
+        span: SourceSpan,
+    },
+    /// `derive :name, expr: <result-expr>`, optionally `, analysis: :ac1`.
+    ///
+    /// A derived signal is a new column computed from probe reads. It is not a
+    /// parameter, and in this version it cannot be referenced by another
+    /// expression (see `docs/language.md`).
+    Derive {
+        name: SpannedName,
+        expr: Expr,
+        /// `analysis: :ac1`, as on `measure`.
+        analysis: Option<SpannedName>,
         span: SourceSpan,
     },
 }
@@ -277,7 +295,8 @@ impl ExpStmt {
             ExpStmt::Op { span }
             | ExpStmt::Save { span, .. }
             | ExpStmt::Param { span, .. }
-            | ExpStmt::Measure { span, .. } => *span,
+            | ExpStmt::Measure { span, .. }
+            | ExpStmt::Derive { span, .. } => *span,
             ExpStmt::Dc(c) | ExpStmt::Ac(c) | ExpStmt::Tran(c) => c.span,
         }
     }
@@ -291,6 +310,7 @@ impl ExpStmt {
             ExpStmt::Save { .. } => "save",
             ExpStmt::Param { .. } => "param",
             ExpStmt::Measure { .. } => "measure",
+            ExpStmt::Derive { .. } => "derive",
         }
     }
 }

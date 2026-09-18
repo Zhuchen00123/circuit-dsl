@@ -47,6 +47,360 @@ pub struct NamedProbe {
 }
 
 // ---------------------------------------------------------------------------
+// Result expressions (plan layer)
+// ---------------------------------------------------------------------------
+
+/// A resolved probe read inside a result expression.
+///
+/// The name is the signal name the backend is asked for and the name the
+/// evaluator looks up later (`v(out)`, `v(a,b)`, `i(r1)`); the probe itself is
+/// the typed identity elaboration resolved.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProbeRef {
+    pub name: String,
+    pub probe: Probe,
+    pub span: SourceSpan,
+}
+
+impl ProbeRef {
+    pub fn new(name: impl Into<String>, probe: Probe, span: SourceSpan) -> Self {
+        Self {
+            name: name.into(),
+            probe,
+            span,
+        }
+    }
+
+    /// The dimension a probe of this kind reads.
+    pub fn dimension(&self) -> crate::units::Dimension {
+        match self.probe {
+            Probe::NodeVoltage(_) | Probe::DifferentialVoltage { .. } => crate::units::VOLTAGE,
+            Probe::DeviceCurrent(_) => crate::units::CURRENT,
+        }
+    }
+}
+
+/// A result expression as the plan layer describes it: resolved probes,
+/// dimensionless literals and the operators the evaluator supports.
+///
+/// This is deliberately *not* the front-end AST: elaboration lowers a written
+/// expression into this form, and `circuit-results` lowers it again into its
+/// runtime AST. No parser type reaches the backend, and `circuit-core` never
+/// depends on `circuit-results`.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ExprIr {
+    /// A dimensionless literal.
+    Number(f64),
+    /// A probe read; the signal name is the one the backend produces.
+    Probe(ProbeRef),
+    Neg(Box<ExprIr>),
+    Add(Box<ExprIr>, Box<ExprIr>),
+    Sub(Box<ExprIr>, Box<ExprIr>),
+    Mul(Box<ExprIr>, Box<ExprIr>),
+    Div(Box<ExprIr>, Box<ExprIr>),
+    /// Absolute value (magnitude for complex data), keeping the unit.
+    Abs(Box<ExprIr>),
+    /// Square root; every dimension exponent must be even.
+    Sqrt(Box<ExprIr>),
+    Min(Box<ExprIr>, Box<ExprIr>),
+    Max(Box<ExprIr>, Box<ExprIr>),
+    /// `20*log10(abs(numerator / denominator))`; both sides share a dimension.
+    GainDb {
+        numerator: Box<ExprIr>,
+        denominator: Box<ExprIr>,
+    },
+}
+
+impl ExprIr {
+    /// The span the expression was written at, for diagnostics.
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            Self::Number(_) => SourceSpan::synthetic(),
+            Self::Probe(p) => p.span,
+            Self::Neg(x) | Self::Abs(x) | Self::Sqrt(x) => x.span(),
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => a.span().merge(b.span()),
+            Self::GainDb {
+                numerator,
+                denominator,
+            } => numerator.span().merge(denominator.span()),
+        }
+    }
+
+    /// Every probe this expression reads, distinct by name, in first-seen order.
+    ///
+    /// This is the automatic dependency set: an expression needs no `save`
+    /// statement to be evaluable, and the collected probes are read from the
+    /// backend without becoming part of the exported signal set.
+    pub fn probes(&self) -> Vec<ProbeRef> {
+        let mut out: Vec<ProbeRef> = Vec::new();
+        self.collect_probes(&mut out);
+        out
+    }
+
+    fn collect_probes(&self, out: &mut Vec<ProbeRef>) {
+        match self {
+            Self::Number(_) => {}
+            Self::Probe(p) => {
+                if !out.iter().any(|q| q.name == p.name) {
+                    out.push(p.clone());
+                }
+            }
+            Self::Neg(x) | Self::Abs(x) | Self::Sqrt(x) => x.collect_probes(out),
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => {
+                a.collect_probes(out);
+                b.collect_probes(out);
+            }
+            Self::GainDb {
+                numerator,
+                denominator,
+            } => {
+                numerator.collect_probes(out);
+                denominator.collect_probes(out);
+            }
+        }
+    }
+
+    /// True when the expression is exactly one probe read.
+    ///
+    /// Used for the documented legacy selection rule: a `measure` over a plain
+    /// probe without `analysis:` keeps searching analyses, while a compound
+    /// expression must be bound explicitly in a multi-analysis experiment.
+    pub fn is_plain_probe(&self) -> bool {
+        matches!(self, Self::Probe(_))
+    }
+
+    /// The dimension of the result when it is statically known.
+    ///
+    /// `None` means "not provable from the written expression" (an
+    /// inconsistent combination is reported separately by
+    /// [`ExprIr::static_dimension_error`]), never "no dimension".
+    pub fn static_dimension(&self) -> Option<crate::units::Dimension> {
+        use crate::units::DIMENSIONLESS;
+        match self {
+            Self::Number(_) => Some(DIMENSIONLESS),
+            Self::Probe(p) => Some(p.dimension()),
+            Self::Neg(x) | Self::Abs(x) => x.static_dimension(),
+            Self::Sqrt(x) => half_dimension(x.static_dimension()?),
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Min(a, b) | Self::Max(a, b) => {
+                let (x, y) = (a.static_dimension()?, b.static_dimension()?);
+                (x == y).then_some(x)
+            }
+            // A product whose exponents leave the `i8` range has no known
+            // dimension either; it is reported by `static_dimension_error`.
+            Self::Mul(a, b) => a.static_dimension()?.checked_mul(b.static_dimension()?),
+            Self::Div(a, b) => a.static_dimension()?.checked_div(b.static_dimension()?),
+            Self::GainDb {
+                numerator,
+                denominator,
+            } => {
+                let (x, y) = (
+                    numerator.static_dimension()?,
+                    denominator.static_dimension()?,
+                );
+                (x == y).then_some(DIMENSIONLESS)
+            }
+        }
+    }
+
+    /// A message when the written expression is dimensionally inconsistent
+    /// *without running anything*, so `cdsl check` can reject it.
+    pub fn static_dimension_error(&self) -> Option<String> {
+        // A dimension that does not fit is checked first: it is a fact about
+        // the written units, not about how they combine at run time, and it is
+        // what `cdsl check` must reject (round-4 R4-02).
+        if let Some(message) = self.exponent_overflow_error() {
+            return Some(message);
+        }
+        let binary = |op: &str, a: &ExprIr, b: &ExprIr| -> Option<String> {
+            let (x, y) = (a.static_dimension()?, b.static_dimension()?);
+            (x != y).then(|| {
+                format!(
+                    "cannot apply `{op}` to `{}` ({x}) and `{}` ({y}): the units differ",
+                    a.render(),
+                    b.render()
+                )
+            })
+        };
+        match self {
+            Self::Number(_) | Self::Probe(_) => None,
+            Self::Neg(x) | Self::Abs(x) => x.static_dimension_error(),
+            Self::Sqrt(x) => {
+                if let Some(message) = x.static_dimension_error() {
+                    return Some(message);
+                }
+                match x.static_dimension() {
+                    Some(d) if half_dimension(d).is_none() => Some(format!(
+                        "sqrt of a quantity in {d} is not representable: every dimension exponent must be even"
+                    )),
+                    _ => None,
+                }
+            }
+            Self::Add(a, b) => binary("+", a, b).or_else(|| {
+                a.static_dimension_error()
+                    .or_else(|| b.static_dimension_error())
+            }),
+            Self::Sub(a, b) => binary("-", a, b).or_else(|| {
+                a.static_dimension_error()
+                    .or_else(|| b.static_dimension_error())
+            }),
+            Self::Mul(a, b) => a
+                .static_dimension_error()
+                .or_else(|| b.static_dimension_error()),
+            Self::Div(a, b) => a
+                .static_dimension_error()
+                .or_else(|| b.static_dimension_error()),
+            Self::Min(a, b) => binary("min", a, b).or_else(|| {
+                a.static_dimension_error()
+                    .or_else(|| b.static_dimension_error())
+            }),
+            Self::Max(a, b) => binary("max", a, b).or_else(|| {
+                a.static_dimension_error()
+                    .or_else(|| b.static_dimension_error())
+            }),
+            Self::GainDb {
+                numerator,
+                denominator,
+            } => {
+                if let Some(message) = numerator
+                    .static_dimension_error()
+                    .or_else(|| denominator.static_dimension_error())
+                {
+                    return Some(message);
+                }
+                match (numerator.static_dimension(), denominator.static_dimension()) {
+                    (Some(x), Some(y)) if x != y => Some(format!(
+                        "gain `{} / {}` must be a ratio of like quantities, but the units are {x} and {y}",
+                        numerator.render(),
+                        denominator.render()
+                    )),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// A short rendering of an operand, for the overflow message.
+    ///
+    /// A user can write an expression with hundreds of factors (the round-4
+    /// reproduction has 128), and pasting the whole tree into a diagnostic
+    /// buries the one fact that matters. The full source line is printed by the
+    /// CLI's span rendering anyway.
+    fn brief(expr: &ExprIr) -> String {
+        const LIMIT: usize = 48;
+        let text = expr.render();
+        if text.chars().count() <= LIMIT {
+            return text;
+        }
+        let head: String = text.chars().take(LIMIT).collect();
+        format!("{head}... ({} characters)", text.chars().count())
+    }
+
+    /// The first product or quotient in the tree whose exponents leave the
+    /// representable range, rendered for the user.
+    ///
+    /// Children are visited before their parent so the message points at the
+    /// *first* operation that cannot be represented, which is the one the user
+    /// has to shorten. `static_dimension` returns `None` for such a tree
+    /// instead of wrapping the exponent (release) or panicking (debug).
+    fn exponent_overflow_error(&self) -> Option<String> {
+        use crate::units::Dimension;
+        let child = |a: &ExprIr, b: &ExprIr| {
+            a.exponent_overflow_error()
+                .or_else(|| b.exponent_overflow_error())
+        };
+        let overflow = |op: &str, a: &ExprIr, b: &ExprIr| -> Option<String> {
+            let (x, y) = (a.static_dimension()?, b.static_dimension()?);
+            let fits = if op == "*" {
+                x.checked_mul(y).is_some()
+            } else {
+                x.checked_div(y).is_some()
+            };
+            (!fits).then(|| {
+                let (low, high) = (Dimension::MIN_EXPONENT, Dimension::MAX_EXPONENT);
+                format!(
+                    "the dimension of `({} {op} {})` is {x} {op} {y}, which leaves the representable \
+                     exponent range (an exponent is held as a signed 8-bit integer, {low}..={high})",
+                    ExprIr::brief(a),
+                    ExprIr::brief(b)
+                )
+            })
+        };
+        match self {
+            Self::Number(_) | Self::Probe(_) => None,
+            Self::Neg(x) | Self::Abs(x) | Self::Sqrt(x) => x.exponent_overflow_error(),
+            Self::Add(a, b) | Self::Sub(a, b) | Self::Min(a, b) | Self::Max(a, b) => child(a, b),
+            Self::Mul(a, b) => child(a, b).or_else(|| overflow("*", a, b)),
+            Self::Div(a, b) => child(a, b).or_else(|| overflow("/", a, b)),
+            Self::GainDb {
+                numerator,
+                denominator,
+            } => child(numerator, denominator),
+        }
+    }
+
+    /// True when every sample this expression can produce is real.
+    ///
+    /// A bare probe is *not* known real: an AC analysis reports complex
+    /// samples, and the language has no implicit magnitude ordering.
+    pub fn is_statically_real(&self) -> bool {
+        match self {
+            Self::Number(_) => true,
+            Self::Probe(_) => false,
+            // abs() returns the magnitude and gain_db() the dB value: both real.
+            Self::Abs(_) | Self::GainDb { .. } => true,
+            Self::Neg(x) | Self::Sqrt(x) => x.is_statically_real(),
+            Self::Add(a, b)
+            | Self::Sub(a, b)
+            | Self::Mul(a, b)
+            | Self::Div(a, b)
+            | Self::Min(a, b)
+            | Self::Max(a, b) => a.is_statically_real() && b.is_statically_real(),
+        }
+    }
+
+    /// The expression as the user would read it, for diagnostics.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Number(x) => crate::format_number(*x),
+            Self::Probe(p) => p.name.clone(),
+            Self::Neg(x) => format!("-{}", x.render()),
+            Self::Add(a, b) => format!("({} + {})", a.render(), b.render()),
+            Self::Sub(a, b) => format!("({} - {})", a.render(), b.render()),
+            Self::Mul(a, b) => format!("({} * {})", a.render(), b.render()),
+            Self::Div(a, b) => format!("({} / {})", a.render(), b.render()),
+            Self::Abs(x) => format!("abs({})", x.render()),
+            Self::Sqrt(x) => format!("sqrt({})", x.render()),
+            Self::Min(a, b) => format!("min({}, {})", a.render(), b.render()),
+            Self::Max(a, b) => format!("max({}, {})", a.render(), b.render()),
+            Self::GainDb {
+                numerator,
+                denominator,
+            } => format!("gain_db({}, {})", numerator.render(), denominator.render()),
+        }
+    }
+}
+
+/// A dimension whose exponents are all even, halved; `None` otherwise.
+fn half_dimension(d: crate::units::Dimension) -> Option<crate::units::Dimension> {
+    let half = |e: i8| if e % 2 == 0 { Some(e / 2) } else { None };
+    Some(crate::units::Dimension::new(
+        half(d.volt)?,
+        half(d.amp)?,
+        half(d.second)?,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Sweeps
 // ---------------------------------------------------------------------------
 
@@ -199,13 +553,43 @@ impl AnalysisKind {
     }
 }
 
-/// One analysis task: what to run and which signals to save.
+/// One analysis task: what to run and which signals to read.
 #[derive(Clone, Debug)]
 pub struct AnalysisTask {
     pub id: AnalysisId,
     pub kind: AnalysisKind,
+    /// The `save` probes the user asked for. Empty keeps the backend
+    /// default (every signal the engine produced), exactly as before.
     pub probes: Vec<NamedProbe>,
+    /// Probes a result expression reads but the user did not ask to export.
+    /// They are read from the backend and never enter the exported signal set;
+    /// the backend falls back to its default set and adds these to it.
+    pub implicit_probes: Vec<NamedProbe>,
     pub span: SourceSpan,
+}
+
+impl AnalysisTask {
+    /// The probes the backend must read: the exported (or default) set plus the
+    /// expression dependencies, distinct by name, explicit ones first.
+    pub fn read_probes(&self) -> Vec<NamedProbe> {
+        let mut out = self.probes.clone();
+        for probe in &self.implicit_probes {
+            if !out.iter().any(|p| p.name == probe.name) {
+                out.push(probe.clone());
+            }
+        }
+        out
+    }
+
+    /// The signal names the user asked to see. `None` means "whatever the
+    /// backend returned", which is the pre-existing behaviour without `save`.
+    pub fn exported_names(&self) -> Option<Vec<String>> {
+        if self.probes.is_empty() {
+            None
+        } else {
+            Some(self.probes.iter().map(|p| p.name.clone()).collect())
+        }
+    }
 }
 
 /// Which reduction a `measure` statement asks for.
@@ -248,14 +632,49 @@ impl MeasureKind {
     }
 }
 
-/// A `measure :name, <kind>: <probe>` request.
+/// Which analysis a derive or measure expression is evaluated against.
+///
+/// The frozen rules (docs/review-evidence/round3/design-contract.md) are:
+///
+/// - an explicit `analysis: :ac1` binds to that analysis identity;
+/// - with exactly one analysis, a new expression may omit the binding;
+/// - with several analyses, a new expression must be bound explicitly;
+/// - a measure over a bare probe with no binding keeps the documented legacy
+///   TRAN -> AC -> DC -> OP search order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnalysisBinding {
+    /// Evaluate against exactly this analysis.
+    Analysis(AnalysisId),
+    /// The legacy rule: pick the first analysis, in the documented order, that
+    /// has the signal and can support the reduction.
+    LegacyPreferred,
+}
+
+/// A `derive :name, expr: ...` request: a named signal computed from a
+/// result expression and exported as a column of the analysis it binds to.
+#[derive(Clone, Debug)]
+pub struct DeriveRequest {
+    pub name: String,
+    pub expr: ExprIr,
+    pub binding: AnalysisBinding,
+    /// The expression as written, for reporting and for the export metadata.
+    pub source: String,
+    pub span: SourceSpan,
+    pub name_span: SourceSpan,
+}
+
+/// A `measure :name, <kind>: <expression>` request.
 #[derive(Clone, Debug)]
 pub struct MeasureRequest {
     pub name: String,
     pub kind: MeasureKind,
-    pub target: Probe,
-    /// The probe as written, for reporting.
-    pub target_name: String,
+    /// The expression to reduce. A bare `ExprIr::Probe` is the historical
+    /// `measure :vmax, max: v(:out)` form and keeps the legacy binding rule
+    /// when no `analysis:` is written.
+    pub expr: ExprIr,
+    pub binding: AnalysisBinding,
+    /// The expression as written, for reporting.
+    pub source: String,
     pub span: SourceSpan,
     pub kind_span: SourceSpan,
 }
@@ -270,6 +689,8 @@ pub struct AnalysisPlan {
     /// Parameter overrides declared on the experiment itself, applied after
     /// subcircuit defaults and before sweep points (brief §5.3).
     pub param_overrides: Vec<(String, Quantity, SourceSpan)>,
+    /// Named derived signals to compute and export.
+    pub derives: Vec<DeriveRequest>,
     /// Measurements to evaluate against the results.
     pub measures: Vec<MeasureRequest>,
     pub span: SourceSpan,
@@ -278,6 +699,63 @@ pub struct AnalysisPlan {
 impl AnalysisPlan {
     pub fn task(&self, id: AnalysisId) -> Option<&AnalysisTask> {
         self.tasks.iter().find(|t| t.id == id)
+    }
+
+    /// The analysis identity the backend stamps on a task result:
+    /// `{kind}{ordinal}` with a 1-based per-kind ordinal in declaration
+    /// order (thevenin.rs). This is also what `analysis: :ac1` names.
+    pub fn result_name(&self, id: AnalysisId) -> Option<String> {
+        let mut per_kind: Vec<(&'static str, u32)> = Vec::new();
+        for task in &self.tasks {
+            let kind = task.kind.name();
+            let ordinal = match per_kind.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n
+                }
+                None => {
+                    per_kind.push((kind, 1));
+                    1
+                }
+            };
+            if task.id == id {
+                return Some(format!("{kind}{ordinal}"));
+            }
+        }
+        None
+    }
+
+    /// Resolve a written analysis identity (`ac1`) to a task.
+    pub fn analysis_id_by_name(&self, name: &str) -> Option<AnalysisId> {
+        self.tasks
+            .iter()
+            .find(|t| self.result_name(t.id).as_deref() == Some(name))
+            .map(|t| t.id)
+    }
+
+    /// Every analysis identity, in plan order, for diagnostics.
+    pub fn analysis_names(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter_map(|t| self.result_name(t.id))
+            .collect()
+    }
+
+    /// `Some((parameter, sweep))` when the plan runs a DC parameter sweep.
+    ///
+    /// A parameter sweep re-elaborates and re-runs the design once per point,
+    /// so the whole experiment produces exactly one stitched dataset for that
+    /// single analysis; callers use this to refuse bindings it cannot honour.
+    pub fn parameter_sweep(&self) -> Option<(String, Sweep)> {
+        let mut found = None;
+        for task in &self.tasks {
+            if let AnalysisKind::Dc(spec) = &task.kind
+                && let SweepTarget::Parameter { name } = &spec.sweep.target
+            {
+                found = Some((name.clone(), spec.sweep.clone()));
+            }
+        }
+        found
     }
 }
 
@@ -321,6 +799,228 @@ mod tests {
     fn degenerate_ranges_report_zero() {
         assert_eq!(ac(1000.0, 10.0, 10, SweepKind::Decade).point_count(), 0);
         assert_eq!(ac(0.0, 10.0, 10, SweepKind::Decade).point_count(), 0);
+    }
+
+    fn probe_ref(name: &str, probe: Probe) -> ProbeRef {
+        ProbeRef::new(name, probe, SourceSpan::synthetic())
+    }
+
+    fn voltage(name: &str) -> ExprIr {
+        ExprIr::Probe(probe_ref(name, Probe::NodeVoltage(NodeId(1))))
+    }
+
+    #[test]
+    fn expression_probe_set_is_deduplicated_in_first_seen_order() {
+        // v(out)/v(in) * v(out) reads each probe once, in the order written.
+        let expr = ExprIr::Mul(
+            Box::new(ExprIr::Div(
+                Box::new(voltage("v(out)")),
+                Box::new(voltage("v(in)")),
+            )),
+            Box::new(voltage("v(out)")),
+        );
+        let names: Vec<String> = expr.probes().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, vec!["v(out)".to_string(), "v(in)".to_string()]);
+    }
+
+    #[test]
+    fn a_gain_ratio_of_two_voltages_is_dimensionless() {
+        use crate::units::{CURRENT, DIMENSIONLESS, VOLTAGE};
+        let gain = ExprIr::Div(Box::new(voltage("v(out)")), Box::new(voltage("v(in)")));
+        assert_eq!(gain.static_dimension(), Some(DIMENSIONLESS));
+        assert_eq!(gain.static_dimension_error(), None);
+
+        // v(out) / i(r1) is an impedance, and dB of it is not defined.
+        let current = ExprIr::Probe(probe_ref("i(r1)", Probe::DeviceCurrent(DeviceId(0))));
+        let mixed = ExprIr::GainDb {
+            numerator: Box::new(voltage("v(out)")),
+            denominator: Box::new(current),
+        };
+        let message = mixed.static_dimension_error().expect("units differ");
+        assert!(message.contains("ratio of like quantities"), "{message}");
+        assert_eq!(mixed.static_dimension(), None);
+        assert_eq!(voltage("v(out)").static_dimension(), Some(VOLTAGE));
+        let _ = CURRENT;
+    }
+
+    #[test]
+    fn adding_volts_and_amps_is_a_static_dimension_error() {
+        let sum = ExprIr::Add(
+            Box::new(voltage("v(out)")),
+            Box::new(ExprIr::Probe(probe_ref(
+                "i(r1)",
+                Probe::DeviceCurrent(DeviceId(0)),
+            ))),
+        );
+        let message = sum.static_dimension_error().expect("units differ");
+        assert!(message.contains("cannot apply"), "{message}");
+    }
+
+    /// The round-4 R4-02 reproduction: 128 voltage factors overflow an `i8`
+    /// exponent. The static analysis must say so — `cdsl check` rejects it —
+    /// and must never panic or wrap.
+    #[test]
+    fn a_dimension_that_does_not_fit_is_a_static_error() {
+        // 1 + 126 factors is exactly V^127; the next one cannot be held.
+        let mut product = voltage("v(vin)");
+        for _ in 0..126 {
+            product = ExprIr::Mul(Box::new(product), Box::new(voltage("v(vin)")));
+        }
+        // V^127 is the last representable exponent.
+        assert_eq!(
+            product.static_dimension(),
+            Some(crate::units::Dimension::new(127, 0, 0))
+        );
+        assert_eq!(product.static_dimension_error(), None);
+
+        let overflowing = ExprIr::Mul(Box::new(product), Box::new(voltage("v(vin)")));
+        assert_eq!(overflowing.static_dimension(), None);
+        let message = overflowing
+            .static_dimension_error()
+            .expect("V^128 does not fit");
+        assert!(
+            message.contains("leaves the representable exponent range"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn only_abs_and_gain_db_are_statically_real() {
+        // A bare probe may be complex (an AC analysis), so a reduction over it
+        // must be rejected statically; abs(...) makes the value real.
+        assert!(!voltage("v(out)").is_statically_real());
+        assert!(ExprIr::Abs(Box::new(voltage("v(out)"))).is_statically_real());
+        assert!(
+            ExprIr::Neg(Box::new(ExprIr::Abs(Box::new(voltage("v(out)"))))).is_statically_real()
+        );
+        assert!(!ExprIr::Neg(Box::new(voltage("v(out)"))).is_statically_real());
+    }
+
+    fn task(id: u32, kind: AnalysisKind) -> AnalysisTask {
+        AnalysisTask {
+            id: AnalysisId(id),
+            kind,
+            probes: Vec::new(),
+            implicit_probes: Vec::new(),
+            span: SourceSpan::synthetic(),
+        }
+    }
+
+    fn plan_with_tasks(tasks: Vec<AnalysisTask>) -> AnalysisPlan {
+        AnalysisPlan {
+            name: "e".into(),
+            circuit_name: "c".into(),
+            tasks,
+            param_overrides: Vec::new(),
+            derives: Vec::new(),
+            measures: Vec::new(),
+            span: SourceSpan::synthetic(),
+        }
+    }
+
+    fn parameter_sweep_kind() -> AnalysisKind {
+        AnalysisKind::Dc(DcSpec {
+            sweep: Sweep {
+                target: SweepTarget::Parameter { name: "r".into() },
+                dimension: crate::units::RESISTANCE,
+                start: 1.0,
+                stop: 2.0,
+                step: Some(1.0),
+                points: None,
+                kind: SweepKind::Linear,
+                include_endpoint: true,
+                span: SourceSpan::synthetic(),
+            },
+        })
+    }
+
+    #[test]
+    fn result_names_follow_per_kind_ordinals() {
+        // Two ACs and an op: identities are per-kind ordinals in plan order,
+        // which is exactly what the backend stamps on each dataset.
+        let ac = || {
+            AnalysisKind::Ac(AcSweep {
+                start_hz: 1.0,
+                stop_hz: 10.0,
+                points: 2,
+                kind: SweepKind::Decade,
+                span: SourceSpan::synthetic(),
+            })
+        };
+        let plan = plan_with_tasks(vec![
+            task(0, ac()),
+            task(1, AnalysisKind::Op),
+            task(2, ac()),
+        ]);
+        assert_eq!(plan.result_name(AnalysisId(0)).as_deref(), Some("ac1"));
+        assert_eq!(plan.result_name(AnalysisId(1)).as_deref(), Some("op1"));
+        assert_eq!(plan.result_name(AnalysisId(2)).as_deref(), Some("ac2"));
+        assert_eq!(
+            plan.analysis_names(),
+            vec!["ac1".to_string(), "op1".to_string(), "ac2".to_string()]
+        );
+        assert_eq!(plan.analysis_id_by_name("ac2"), Some(AnalysisId(2)));
+        assert_eq!(plan.analysis_id_by_name("tran1"), None);
+        assert_eq!(plan.analysis_id_by_name("ac"), None, "no bare kind names");
+        assert!(plan.parameter_sweep().is_none());
+    }
+
+    #[test]
+    fn a_parameter_sweep_is_detected_and_a_source_sweep_is_not() {
+        let sweeping = plan_with_tasks(vec![task(0, parameter_sweep_kind())]);
+        let (name, sweep) = sweeping.parameter_sweep().expect("parameter sweep");
+        assert_eq!(name, "r");
+        assert_eq!(sweep.start, 1.0);
+
+        let source = AnalysisKind::Dc(DcSpec {
+            sweep: Sweep {
+                target: SweepTarget::SourceValue {
+                    device: DeviceId(0),
+                    name: "v1".into(),
+                },
+                dimension: crate::units::VOLTAGE,
+                start: 0.0,
+                stop: 5.0,
+                step: Some(1.0),
+                points: None,
+                kind: SweepKind::Linear,
+                include_endpoint: true,
+                span: SourceSpan::synthetic(),
+            },
+        });
+        let native = plan_with_tasks(vec![task(0, source)]);
+        assert!(native.parameter_sweep().is_none());
+    }
+
+    #[test]
+    fn implicit_probes_are_read_but_not_exported() {
+        let mut task = AnalysisTask {
+            id: AnalysisId(0),
+            kind: AnalysisKind::Op,
+            probes: vec![NamedProbe {
+                name: "v(in)".into(),
+                probe: Probe::NodeVoltage(NodeId(1)),
+                span: SourceSpan::synthetic(),
+            }],
+            implicit_probes: vec![NamedProbe {
+                name: "v(out)".into(),
+                probe: Probe::NodeVoltage(NodeId(2)),
+                span: SourceSpan::synthetic(),
+            }],
+            span: SourceSpan::synthetic(),
+        };
+        let read: Vec<String> = task.read_probes().into_iter().map(|p| p.name).collect();
+        assert_eq!(read, vec!["v(in)".to_string(), "v(out)".to_string()]);
+        assert_eq!(task.exported_names(), Some(vec!["v(in)".to_string()]));
+
+        // No save statement: the backend keeps its default set, and nothing is
+        // excluded from the export.
+        task.probes.clear();
+        assert_eq!(task.exported_names(), None);
+        // The implicit probe is still readable, and de-duplicated by name.
+        task.implicit_probes.push(task.implicit_probes[0].clone());
+        let read: Vec<String> = task.read_probes().into_iter().map(|p| p.name).collect();
+        assert_eq!(read, vec!["v(out)".to_string()]);
     }
 
     #[test]

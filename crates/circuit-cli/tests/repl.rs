@@ -270,3 +270,78 @@ end
     assert!(errors.contains("`r` is not declared"), "{errors}");
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// The REPL prints a measure with the analysis it came from, exactly as a
+/// file run does: in a multi-analysis experiment the name alone would not
+/// say which analysis was measured.
+#[test]
+fn a_run_reports_which_analysis_each_measure_came_from() {
+    let out = repl(
+        &[&example("rc_filter.cdsl").display().to_string()],
+        ":run response\n:quit\n",
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{}", stderr(&out));
+    let text = stdout(&out);
+    let measures: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("measure "))
+        .collect();
+    assert_eq!(measures.len(), 3, "three measures:\n{text}");
+    for line in &measures {
+        assert!(
+            line.trim_end().ends_with("(tran1)"),
+            "a measure must name its analysis: {line}"
+        );
+    }
+}
+
+/// A run whose expression fails is reported like any other error: the
+/// transcript shows a diagnostic, the script exits non-zero, nothing is
+/// written, and the session survives it.
+#[test]
+fn a_failed_run_is_reported_and_writes_nothing() {
+    let dir = std::env::temp_dir().join("cdsl_repl_failed_run");
+    let _ = std::fs::remove_dir_all(&dir);
+    let script = format!(
+        "circuit :two_node do
+  node :a, :b
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :b, value: 1.kohm
+  resistor :r2, p: :b, n: :gnd, value: 1.kohm
+end
+experiment :e, circuit: :two_node do
+  op
+  save v(:b)
+  measure :bad, max: v(:b)/0
+end
+:run e --out {}
+x = 1 + 1
+:quit
+",
+        dir.display()
+    );
+
+    let out = repl(&[], &script);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{}", stderr(&out));
+    let errors = stderr(&out);
+    assert!(
+        errors.contains("E_"),
+        "a diagnostic must be reported:\n{errors}"
+    );
+    let text = stdout(&out);
+    assert!(!text.contains("wrote"), "nothing may be written:\n{text}");
+    assert!(
+        !text.contains("measure bad"),
+        "a failed measure must not be printed as a value:\n{text}"
+    );
+    // The session carried on after the failed run.
+    assert!(text.contains("x = 2"), "{text}");
+    let written: Vec<_> = std::fs::read_dir(&dir)
+        .map(|d| d.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        written.is_empty(),
+        "no partial export may exist in {}",
+        dir.display()
+    );
+}

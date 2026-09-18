@@ -2,7 +2,7 @@
 
 ## 项目简介
 
-circuit-dsl 是一门描述模拟电路的小型领域语言，配一套纯 Rust 的实现：`.cdsl` 源文件声明电路、器件、参数与实验，命令行工具 `cdsl` 负责检查源文件、执行 op / dc / ac / tran 分析、求测量值并导出 CSV / JSON 结果。`cdsl repl` 提供交互式会话：表达式即时求值、会话变量、逐条定义电路与实验并直接运行。它面向可复现的小规模模拟电路验证：电路由结构化 IR 直接交给仿真后端构造，不生成 SPICE / Cirq 源文本，展开期的错误以带源码位置的诊断给出。工作区测试实测 `cargo test --workspace` 共 **456 个测试全部通过**（0 失败、24 个测试目标，本轮由 413 增至 456，新增 43 个），`cargo clippy --workspace --all-targets -- -D warnings` 0 条警告，`cargo fmt --all -- --check` 无差异。
+circuit-dsl 是一门描述模拟电路的小型领域语言，配一套纯 Rust 的实现：`.cdsl` 源文件声明电路、器件、参数与实验，命令行工具 `cdsl` 负责检查源文件、执行 op / dc / ac / tran 分析、求测量值并导出 CSV / JSON 结果。`cdsl repl` 提供交互式会话：表达式即时求值、会话变量、逐条定义电路与实验并直接运行。它面向可复现的小规模模拟电路验证：电路由结构化 IR 直接交给仿真后端构造，不生成 SPICE / Cirq 源文本，展开期的错误以带源码位置的诊断给出。工作区测试实测 `cargo test --workspace` 共 **660 个测试全部通过**（0 失败；第 3 轮为 554，第 4 轮阶段 A 冻结快照 618、阶段 B 新增 42），`cargo clippy --workspace --all-targets -- -D warnings` 0 条警告，`cargo fmt --all -- --check` 无差异。这些是**实测值**：第 3 轮的逐场景数值与退出码见 [`docs/review-evidence/round3/acceptance.md`](docs/review-evidence/round3/acceptance.md)，第 4 轮阶段 A 见 [`docs/review-evidence/round4/acceptance.md`](docs/review-evidence/round4/acceptance.md)、阶段 B 见 [`docs/review-evidence/round4/qa-acceptance-phase-b.md`](docs/review-evidence/round4/qa-acceptance-phase-b.md)（静态门禁在阶段 A 冻结快照上实测 exit 0，第 4 轮最终复跑由 lead 统一执行）；README 不再维护会漂移的历史计数。
 
 ## 快速开始
 
@@ -128,10 +128,14 @@ experiment `response` (backend thevenin 0.5.0)
   ac1: 121 frequency points; signals: v(vin), v(vout), i(input), i(r1)
   tran1: 1019 time points; signals: v(vin), v(vout), i(input), i(r1)
   ...
-  measure vfinal = 993.262 mV
-  measure vavg = 801.347 mV
-  measure vrms = 838.266 mV
+  measure vfinal = 0.9932620899316276 V (tran1)
+  measure vavg = 0.8013465976386364 V (tran1)
+  measure vrms = 0.8382662216736428 V (tran1)
 ```
+
+第 3 轮起，测量行由结果层统一渲染（`Measured::render_with_analysis`）：文件模式与 REPL 打印**同一条**
+文本，`(tran1)` 是实际取值的分析标识。此前的 REPL 会把测量值换算成工程单位（`993.262 mV`），
+与 `run` 命令的输出不一致；现在两者一致，单位与数值仍与 CSV/JSON 中完全相同。
 
 几条真实发生的错误（会话里先 `:load examples/voltage_divider.cdsl`）：
 
@@ -189,7 +193,7 @@ note: Verified on Windows MSVC only.
 
 - 顶层定义 `circuit`、`subcircuit`（必须声明 `ports`）、`experiment`，出现顺序无关。
 - 层次实例 `instance :x, of: :sub, ports: { ... }, params: { ... }`；实例内部节点互相隔离，层次路径用 `.` 连接（如 `stage1.internal`）。
-- `param`：`default:` 可省略；可由实例或实验覆盖；覆盖顺序为默认值 → 实例/实验 → 扫描点；影响条件、循环次数或连线的参数是拓扑参数，不允许扫描。
+- `param`：`default:` 可省略；**同一 body 内前向引用合法**（一个 body 的声明先整体收集，再按依赖顺序求值，书写顺序只用来打破平局），自引用与多节点环报 `E_PARAM_CYCLE`（带闭合路径与每个参与声明的位置），未知名字仍是 `E_NAME`。覆盖顺序为默认值 → 实例 `params:` → 实验 `param:` → 扫描点 → REPL `:run name=expr`，被覆盖的参数不重新求值它的默认值。影响条件、循环次数或生成名称的参数是拓扑参数：扫描它在 `check` / `run` / `:load` 阶段就报 `E_TOPO_PARAM`（带"被扫描参数 → 中间参数 → 使用点"的解释路径），只出现在数值位置的扫描仍然可用。
 - `for`（数组元素与含两端的整数区间）、`if / elsif / else`；循环变量可参与表达式并用于生成器件名（动态名必须唯一）。
 - 量纲字面量（`1.kohm`、`100.nF`、`1.us`、`10.Hz`、`1.V` 等），`+ - * /` 与比较会做量纲检查；内置常量 `pi`、`e`；数值函数 `abs` / `sqrt` / `min` / `max`；波形函数 `pulse` / `sin` / `pwl`。
 - 符号（`:name`）与字符串（`"text"`）是不同类型；支持数组、字典、布尔与以 `#` 开始的行注释；换行终止语句，括号内、逗号后、行尾二元运算符后可续行。
@@ -213,9 +217,13 @@ note: Verified on Windows MSVC only.
 ### 结果与导出
 
 - 探针：`save v(:n)`、`v(:a, :b)`（= Va − Vb）、`i(:dev)`（正方向 `p → n`）；测量：`measure :vmax, max: v(:out)`，归约可选 `max` / `min` / `avg` / `rms`。
+- **结果表达式（第 3 轮新增）**：`derive :name, expr: <表达式>` 导出命名派生信号，`measure` 的目标可以是表达式，例如 `measure :avg_power, avg: v(:vin, :vout) * i(:r1)`。表达式支持探针、无量纲常量、括号、一元 `+`/`-`、`+ - * /` 与 `abs` / `sqrt` / `min` / `max` / `gain_db`。表达式用到的探针**自动读取**，不要求写 `save`；隐式探针只参与求值，不进入导出列。多分析实验用 `analysis: :ac1`（`{kind}{序号}`，如 `ac1`、`tran2`）显式绑定；只有一个分析时可省略；不写且无法唯一确定时报 `E_AMBIGUOUS`，绝不按「哪个跑成功」猜。不带 `analysis:` 的旧式直接探针测量保持原有 TRAN → AC → DC → OP 选择顺序。派生信号与测量都在**原始求解网格**上求值，之后才重采样，所以 `output_interval` 不改变测量值，也不会先把信号插值再算非线性表达式。实测 RC 截止频率点：`gain = 0.5 − 0.5j`、`|gain| = 0.7071067811865472`、`gain_db = −3.010299956639815`；`avg: v(:vin,:vout) * i(:r1)` 与独立 `v²/R` 梯形积分相对偏差 1.3e-16。
 - `avg` / `rms` 在**非均匀求解器时间轴**上按时间积分，而不是样本算术平均。实测 `examples/rc_filter.cdsl`：`vavg = 0.8013466 V`、`vrms = 0.8382662 V`（`vfinal = 0.9932621 V`）。
 - CSV：第一列为轴；复数列拆成 `_re` / `_im`（实测 `response.ac1.csv` 表头 `frequency,v(vin)_re,v(vin)_im,...`）；时间轴非均匀（同一实验 1019 个时间点，逐点由求解器决定）。
-- JSON：保留单位、轴类型与后端元数据；非有限值导出为 `null`（CSV 为空字段）并给出警告。
+- **表达式错误策略（第 4 轮）**：结果表达式的**每个运算节点**都校验自己产出的样本——实数 `is_finite()`、复数实部与虚部都有限；`sqrt` 的负样本、分母精确为 0、`gain_db` 零幅值都是错误，**没有 epsilon、没有饱和、没有跳过样本**，所以 `min(sqrt(-1), 2)` 在 `sqrt` 处失败、不会被 `min` 掩盖，`1e308 * 1e308` 也不会让 `inf` 继续参与计算。**常量**表达式（不读信号）在 `cdsl check` 阶段就被同一个求值器拒绝（`sqrt(-1)`、`1e308*1e308`、`x/0`、`gain_db(0, x)`）；读信号的表达式只做静态量纲检查，在 `cdsl run` 报错。诊断带 `analysis`/`kind`/`signal`/`sample`/`index`，标量分析会说明没有轴坐标。
+- **量纲指数溢出是诊断**：量纲指数是 `i8`（`-128..=127`），`*` `/` 走受检算术，超出范围报 `E_DIMENSION`；128 个 `v(:vin)` 因子在 debug 与 release 都是 exit 1，不 panic、不回绕。
+- **表达式深度上限 256**（`circuit_core::limits::MAX_EXPR_DEPTH`）：更深的表达式报 `E_LIMIT`；`cdsl` 的每条子命令都在 64 MiB 栈的线程上运行，所以被接受的深度在 debug 构建里也能处理（FINDING-1）。
+- JSON：保留单位、轴类型与后端元数据；非有限值导出为 `null`（CSV 为空字段）。渲染期警告（每个非有限样本一条）由 `cdsl run` 与 REPL 打印；`<file>.json` 里的 `diagnostics` 数组是**数据集自己的**来源诊断，与这批渲染警告互补、不是同一批，同一个数据集写 CSV+JSON 只报一次。
 - 本仓库实测数值：分压器 OP 精确给出 `v(out)=3 V`、`i(r1)=+2 mA`、`i(v1)=-2 mA`；参数扫描逐点等于 `3·1.5k/(r+1.5k)`（实测 r=500 Ω → 2.25 V、1 kΩ → 1.8 V、2 kΩ → 1.285714… V）；`examples/diode_rectifier.cdsl` 的 `op` 给出 `v(vout)=0.692872 V`，其 DC 扫描在 5 V 点给出 0.692869 V（对照 Shockley 方程二分法独立解 0.692868 V），扫描中压降只随电流对数变化（1 V 时 0.629424 V，5 V 时 0.692869 V）。
 - 后端准入用例实测（`docs/backend-evaluation.md`）：RC 交流对齐 `H=1/(1+jωRC)`，最差偏差 5.55e-17。
 - RC 瞬态用**有延迟的有限斜坡**与匹配的分段解析解对照（见 `docs/backend-evaluation.md` §5）：基线配置 `tmax=τ/1000` 下 6025 个返回点**逐点**满足 TRAN 判据（`atol=1e-5 V`、`rtol=1e-3`），最大误差 **4.999167e-7 V**。两处历史结论都已被本轮证据取代：(a) 旧文档的「对齐 `1-e^{-t/τ}`，最差偏差 1.95e-3 V」是**参考模型错**——当时的适配层把 `.tran` 的 step 取成输出间隔，使引擎把声明的 1 ps 上升沿夹紧到 500 ns，用理想阶跃当参考必然得到 `C·e^{-t/τ}`（`C≈-2.504e-3 V`）的残差；(b) 适配层现在按声明边沿选 step，声明值会被兑现（`rise=10.ns`、`output_interval` 1 ns→100 ns 时原始求解网格逐位相同，约 50 ns 处 `v(vin)=1 V`）。
@@ -227,7 +235,9 @@ note: Verified on Windows MSVC only.
 - **仅在 Windows MSVC 上验证**（rustc 1.98.1 / `stable-x86_64-pc-windows-msvc`）。Linux 目标（`x86_64-unknown-linux-musl` 存在编译目标）在本项目中未验证，不做跨平台声明。
 - **电流探针只覆盖部分器件**：电压源与电感的支路电流由引擎直接给出；电阻的电流按欧姆定律推导，并用引擎给出的源电流交叉验证；电容、二极管、独立电流源的电流**明确拒绝**（报 `E_UNSUPPORTED`），不做近似。
 - **参数扫描只支持单个参数**（`dc param:`），不支持多参数联合扫描。
-- **参数只能引用其之前声明的参数**（顺序敏感），因此参数依赖不可能是环；扫描参数时每个点会检查拓扑不变，拓扑参数不允许扫描。
+- **参数依赖是 DAG，不是声明顺序**：同一 body 内前向引用合法，声明先整体收集再按依赖顺序求值；环报 `E_PARAM_CYCLE`（带闭合路径与每个参与声明的位置），不是 `E_NAME`。扫描参数时每个点仍会检查拓扑不变，而拓扑参数更早在 `check` / `run` / `:load` 阶段就被 `E_TOPO_PARAM` 拒绝（带解释路径）；只改元件数值的扫描照常可用。
+- **表达式深度上限 256**：超过 `MAX_EXPR_DEPTH` 报 `E_LIMIT`；`cdsl` 在 64 MiB 栈线程上运行每个子命令，这条上限同时保护解析器与结果表达式求值器，不会以栈溢出终止进程。**边界**：在更小栈上直接嵌入本项目的 crate 时，需要调用方自己提供同样的栈（`docs/review-evidence/round4/findings.md` FINDING-1 的边界）。
+- **REPL 定义期不预求值常量表达式**：`cdsl check` 会拒绝 `sqrt(-1)` 这类常量表达式，而 REPL 在定义实验时只做静态检查，`:run` 时才给出同一条 `E_VALUE` 诊断（两处最终文本一致）。
 - **`max_step` 约束的是求解器内部步长，不是输出间隔**：返回的时间轴由求解器决定且通常非均匀。要固定输出间隔请用 `tran output_interval:`——它在求解后重采样，不参与求解。
 - 悬空节点（无直流参考通路）由**前端**检查：引擎对**真无参考**的线性网络会以 `matrix is singular, cannot solve` 失败，但该错误不指向任何节点，也无法区分「合法开路输出」与「真正无参考」（实测见 `docs/review-evidence/floating-audit.md`；旧文档把它写成「gmin 把节点拉住并返回 Ok」，已废弃）。因此 `circuit-core::connectivity` 在展开结束时做直流参考通路可达性检查——判据是能否经**直流导通**器件到达地，电容与独立电流源不算——命中时报 `E_NAME`。同一个 body 内没有任何器件连接的节点也会被报出。
 - **PULSE 的 `rise` / `fall` / `period` 不会被分析选项展宽**：引擎把 PULSE 的上升/下降时间夹紧到 `.tran` 的 print step（`tr.unwrap_or(tstep).max(tstep)`），而适配层现在把该 step 选为 `min(span/1000, 电路中声明的最小 rise/fall/period)`，且**完全不受 `output_interval` 影响**，所以已声明的边沿会按声明值执行（`examples/rc_filter.cdsl` 的 `rise: 1.ns` 不再是 500 ns 斜坡）。若声明的边沿是 0 或非有限（引擎没有理想零宽边沿），或在给定窗口内执行需要超过 1e6 个求解步，`cdsl check` / `cdsl run` 会给出明确的能力诊断（`E_UNSUPPORTED` / `E_LIMIT`）而不是静默展宽。实测与源码依据见 `docs/review-evidence/round2/`。
@@ -235,6 +245,8 @@ note: Verified on Windows MSVC only.
 - **求解器容差没有产品通道**：适配层 `build_circuit` 把 Thevenin 的 `options` 传成空，因此 `RELTOL` / `ABSTOL` / `VNTOL` / `GMIN` 恒为引擎默认（`reltol = 1e-3`、`abstol = 1e-12`），DSL 也没有对应语法。容差只影响 `max_step` 未钉住步长时的 LTE 步长控制；本轮在 `_probe`（直接构造 `cirq_ir::Circuit`）里做过受控实验：`RELTOL` / `ABSTOL` / `TRTOL` 单因子不可观测，`RELTOL+ABSTOL` 交互会改变轨迹但**不改变断点重启步与 §17 结论**。适配层新增容差通道属于后续工作。
 - **`--out` 指向一个已存在的普通文件时**：报的是「无法创建目录」而不是 `guard_output` 的防覆盖诊断，退出码仍为 1，输入源文件不会被改写（`docs/review-evidence/cli-qa.md` 的 F6）。
 - 首期只对外开放 R / L / C / 独立电压源 / 独立电流源 / 二极管，其余器件即便后端声明支持也未在本项目验证。
+- **复数没有隐式大小顺序**：`max` / `min` 不能直接归约复数表达式（AC 的 `v(...)` 是复数），必须先写 `abs(...)` / `gain_db(...)`；直接归约在 check 阶段（显式绑定 AC 分析）或运行阶段报 `E_TYPE`，不会静默取模。
+- **参数扫描实验只能绑定被扫描的那个分析**：`dc param:` 逐点重跑并拼接出唯一数据集（文件名 `dc_param_<参数>`），把派生信号或测量绑定到同实验的其它分析会在求解前被明确拒绝（`E_UNSUPPORTED`），不会静默丢弃。
 
 ## 尚未实现 / 未验证
 
@@ -245,7 +257,7 @@ note: Verified on Windows MSVC only.
 - 噪声、灵敏度、Monte Carlo、优化、参数拟合。
 - 多参数联合扫描（仅单参数）。
 - `while` 循环、递归、用户自定义函数、`include` 与外部模型文件。
-- 复数的完整结果表达式（如任意传递函数表达式）。
+- 派生信号之间的引用：`derive` 只能引用探针与常量，不能引用另一个 `derive`，也不能跨分析取数据（首期实现边界，见 `docs/language.md` §7）。
 - `uic`（跳过工作点）——后端路径未验证，未开放。
 - 跨平台构建（仅 Windows MSVC 实测）。
 
@@ -267,7 +279,7 @@ note: Verified on Windows MSVC only.
 
 ```
 crates/circuit-core      语义 IR、单位与量纲、诊断码、展开 / 结果上限（Limits）
-crates/circuit-dsl       词法器、语法分析器、展开器（子电路、循环 / 条件、参数覆盖、探针解析）
+crates/circuit-dsl       词法器、语法分析器、展开器（参数依赖图、子电路、循环 / 条件、参数覆盖、探针解析）
 crates/circuit-backend   SimulationBackend 抽象、Thevenin 0.5.0 适配层、参数扫描驱动
 crates/circuit-results   数据集与轴、测量求值（max/min/avg/rms）、CSV / JSON 导出
 crates/circuit-session   会话状态与命令、实验执行（文件模式与 REPL 共用）

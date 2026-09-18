@@ -34,8 +34,9 @@ use circuit_core::ir::{
     Waveform, terminal,
 };
 use circuit_core::plan::{
-    AcSweep, AnalysisKind, AnalysisPlan, AnalysisTask, DcSpec, MeasureKind, MeasureRequest,
-    NamedProbe, Probe, Sweep, SweepKind, SweepTarget, TranSpec,
+    AcSweep, AnalysisBinding, AnalysisKind, AnalysisPlan, AnalysisTask, DcSpec, DeriveRequest,
+    ExprIr, MeasureKind, MeasureRequest, NamedProbe, Probe, ProbeRef, Sweep, SweepKind,
+    SweepTarget, TranSpec,
 };
 use circuit_core::span::SourceSpan;
 use circuit_core::units::{
@@ -45,10 +46,13 @@ use circuit_core::units::{
 use circuit_core::{AnalysisId, CircuitId, DeviceId, GROUND, Limits, ModelId, NodeId};
 
 use crate::ast::{
-    self, AnalysisCall, Arg, Call, CircuitDef, DeviceStmtKind, ExpStmt, Expr, ExprKind, ForIter,
-    Program, SpannedName, Stmt,
+    self, AnalysisCall, Arg, BinaryOp, Call, CircuitDef, DeviceStmtKind, ExpStmt, Expr, ExprKind,
+    ForIter, Program, SpannedName, Stmt, UnaryOp,
 };
 use crate::eval::{self, Value};
+use crate::param_graph::{
+    BodyGraph, Cycle, Decl, DesignGraph, PathStep, Read, ScopePath, UseKind, UseSite,
+};
 
 /// The evaluator is shared with the REPL (`crate::eval`); these are the
 /// elaborator's entry points to it, so call sites read as they always did.
@@ -228,6 +232,104 @@ impl eval::Variables for Scope {
     }
 }
 
+/// A `derive` statement collected before its analysis binding is known.
+///
+/// The statements are gathered in source order while the task list is built,
+/// and resolved afterwards: `analysis: :ac2` only means something once every
+/// analysis of the experiment has been seen (contract §3).
+struct RawDerive<'a> {
+    name: &'a SpannedName,
+    expr: &'a Expr,
+    analysis: Option<&'a SpannedName>,
+    span: SourceSpan,
+}
+
+/// A `measure` statement collected before its analysis binding is known.
+struct RawMeasure<'a> {
+    name: &'a SpannedName,
+    kind: MeasureKind,
+    kind_span: SourceSpan,
+    /// The expression the reduction is applied to.
+    target: &'a Expr,
+    analysis: Option<&'a SpannedName>,
+    span: SourceSpan,
+}
+
+/// One body's parameter declarations with their dependency graph, ready to be
+/// evaluated (contract §4.4).
+struct PreparedParams<'b> {
+    /// The declarations in source order; `graph.decls()[i]` describes `params[i]`.
+    params: Vec<&'b ast::ParamDecl>,
+    graph: BodyGraph,
+    /// Deterministic evaluation order: indices into `params`.
+    order: Vec<usize>,
+}
+
+/// Add the probes one result expression reads to a task's implicit set.
+///
+/// This is a *dependency* set, not an export: `AnalysisTask::read_probes`
+/// merges it with the `save` probes, so a name the user already saved must not
+/// be requested twice, and a probe nobody wrote must never appear.
+fn add_implicit_probes(task: &mut AnalysisTask, probes: &[ProbeRef]) {
+    for probe in probes {
+        let known = task.probes.iter().any(|p| p.name == probe.name)
+            || task.implicit_probes.iter().any(|p| p.name == probe.name);
+        if !known {
+            task.implicit_probes.push(NamedProbe {
+                name: probe.name.clone(),
+                probe: probe.probe.clone(),
+                span: probe.span,
+            });
+        }
+    }
+}
+
+/// True when a task is a DC sweep over a non-topology parameter.
+///
+/// This is the one shape the sweep driver can execute, and the reason an
+/// experiment cannot declare two of them (see the check in
+/// `elaborate_experiment`).
+fn is_parameter_sweep(task: &AnalysisTask) -> bool {
+    matches!(
+        &task.kind,
+        AnalysisKind::Dc(spec) if matches!(spec.sweep.target, SweepTarget::Parameter { .. })
+    )
+}
+
+/// Attach a result expression's dependencies to the tasks that may read them.
+///
+/// A request bound to one analysis needs its probes there; a legacy measure
+/// may be evaluated against any analysis, so every task has to be able to
+/// produce them.
+fn attach_implicit(plan: &mut AnalysisPlan, binding: AnalysisBinding, probes: &[ProbeRef]) {
+    match binding {
+        AnalysisBinding::Analysis(id) => {
+            if let Some(task) = plan.tasks.iter_mut().find(|t| t.id == id) {
+                add_implicit_probes(task, probes);
+            }
+        }
+        AnalysisBinding::LegacyPreferred => {
+            for task in &mut plan.tasks {
+                add_implicit_probes(task, probes);
+            }
+        }
+    }
+}
+
+/// What a result expression may call, for the "unknown function" diagnostic.
+const RESULT_FUNCTIONS: &str = "available: v(:node), v(:a, :b), i(:device), abs(x), sqrt(x), min(a, b), max(a, b), gain_db(a, b)";
+
+/// The written shape of a result-expression function, for arity diagnostics.
+fn result_function_usage(name: &str) -> &'static str {
+    match name {
+        "abs" => "abs(x)",
+        "sqrt" => "sqrt(x)",
+        "min" => "min(a, b)",
+        "max" => "max(a, b)",
+        _ => "gain_db(numerator, denominator)",
+    }
+}
+
 struct Elaborator<'a> {
     program: &'a Program,
     limits: Limits,
@@ -252,6 +354,18 @@ struct Elaborator<'a> {
     /// body and not to elaboration-time control flow; this counter is what
     /// makes that rule checkable instead of a convention.
     block_depth: u32,
+    /// The parameter graph of the design being elaborated (round-4 phase B).
+    ///
+    /// A node is a parameter **in one body instance**, so `top.r` and
+    /// `top.stage1.r` are different nodes and a sweep of one can never implicate
+    /// the other (contract §4.1).
+    design: DesignGraph,
+    /// Loop variables in scope, innermost last.
+    ///
+    /// A loop variable shadows a parameter of the same name for the duration of
+    /// one iteration, so a topology use site written inside a loop must not be
+    /// credited to that parameter (dag-recon A6).
+    loop_vars: Vec<String>,
 }
 
 impl<'a> Elaborator<'a> {
@@ -270,6 +384,8 @@ impl<'a> Elaborator<'a> {
             stack: Vec::new(),
             steps: 0,
             block_depth: 0,
+            design: DesignGraph::new(),
+            loop_vars: Vec::new(),
         }
     }
 
@@ -284,10 +400,20 @@ impl<'a> Elaborator<'a> {
     /// produce a name that would be unwritable elsewhere in the language. The
     /// uniqueness half of "deterministic and unique" is enforced by the
     /// ordinary duplicate checks, which see the resolved names.
-    fn resolve_name(&mut self, n: &SpannedName, scope: &mut Scope) -> Option<String> {
+    fn resolve_name(
+        &mut self,
+        n: &SpannedName,
+        scope: &mut Scope,
+        ctx: &Bodies,
+        what: &str,
+    ) -> Option<String> {
         let Some(expr) = &n.expr else {
             return Some(n.name.clone());
         };
+
+        // A computed name is a topology use point (contract §4.5): what it
+        // evaluates to decides which device, node or terminal exists.
+        self.note_use(ctx, UseKind::ComputedName, what, n.span, &[expr]);
 
         match self.eval(expr, scope) {
             Ok(Value::Str(s)) => {
@@ -342,7 +468,22 @@ impl<'a> Elaborator<'a> {
 
         let before = self.error_count;
         let mut top_ctx = Bodies::top(def.name.clone());
-        self.run_body(&def.body, &mut scope, &mut top_ctx);
+
+        // Round-4 phase B: the body's `param` declarations are collected and
+        // evaluated in dependency order *before* the body runs, so a forward
+        // reference inside one body is legal (contract §4.4) and every parameter
+        // is in scope for the statements that use it.
+        let overridden: HashSet<String> =
+            overrides.iter().map(|(name, _, _)| name.clone()).collect();
+        if let Some(prepared) =
+            self.collect_params(&def.body, &mut scope, &ScopePath::root(), &overridden)
+        {
+            self.evaluate_params(&prepared, &mut scope);
+        }
+
+        if self.error_count == before {
+            self.run_body(&def.body, &mut scope, &mut top_ctx);
+        }
 
         if self.error_count > before {
             // Report what we have, but do not hand back a half-built circuit
@@ -445,6 +586,8 @@ impl<'a> Elaborator<'a> {
         self.model_spans.clear();
         self.stack.clear();
         self.steps = 0;
+        self.design.clear();
+        self.loop_vars.clear();
     }
 
     fn declare_ground(&mut self) {
@@ -535,6 +678,226 @@ impl<'a> Elaborator<'a> {
     }
 
     // -----------------------------------------------------------------------
+    // The parameter graph (round-4 phase B, contract §4)
+    // -----------------------------------------------------------------------
+
+    /// Collect one body's `param` declarations and build their dependency graph,
+    /// before the body itself runs (contract §4.4).
+    ///
+    /// `overridden` names the parameters whose effective definition is an
+    /// override: their defaults are not part of the graph and produce no
+    /// diagnostic in this elaboration (§4.3). Everything else is a node whose
+    /// edges come from the names its default reads. A name this body does not
+    /// declare is not an edge, so it can never look like a cycle, and it is
+    /// still reported as `E_NAME` when the definition that reads it is
+    /// evaluated.
+    ///
+    /// `None` means a diagnostic was reported and the body must not run; the
+    /// caller evaluates what it did get with
+    /// [`Elaborator::evaluate_params`].
+    fn collect_params<'b>(
+        &mut self,
+        body: &'b [Stmt],
+        scope: &mut Scope,
+        scope_path: &ScopePath,
+        overridden: &HashSet<String>,
+    ) -> Option<PreparedParams<'b>> {
+        // ---- collect, in source order --------------------------------------
+        let mut params: Vec<&'b ast::ParamDecl> = Vec::new();
+        let mut decls: Vec<Decl> = Vec::new();
+        for stmt in body {
+            let Stmt::Param(p) = stmt else {
+                continue;
+            };
+
+            if p.name.expr.is_some() {
+                self.error(
+                    Diagnostic::error(Code::Type, "a parameter name must be written literally")
+                        .at(p.name.span)
+                        .with_note(
+                            "a computed name cannot be referred to by the expressions that use it",
+                        ),
+                );
+                return None;
+            }
+
+            if !scope.declared.insert(p.name.name.clone()) {
+                self.error(
+                    Diagnostic::error(
+                        Code::Duplicate,
+                        format!("parameter `{}` is declared twice", p.name.name),
+                    )
+                    .at(p.name.span)
+                    .with_secondary(scope.span(&p.name.name), "first declared here"),
+                );
+                return None;
+            }
+
+            // Record where this parameter was written, so a later duplicate can
+            // point back here even when an override supplied the value.
+            scope.spans.insert(p.name.name.clone(), p.name.span);
+
+            // An override is the effective definition, so the default itself
+            // contributes no edge (contract §4.3). The chain already delivered
+            // its value into `scope`; an instance `params:` binding is known
+            // before the body runs, which is why the caller passes it in too.
+            let is_overridden =
+                overridden.contains(&p.name.name) || scope.vars.contains_key(&p.name.name);
+            let reads = match (&p.default, is_overridden) {
+                (Some(default), false) => reads_of(default),
+                _ => Vec::new(),
+            };
+            decls.push(Decl {
+                name: p.name.name.clone(),
+                span: p.name.span,
+                reads,
+                overridden: is_overridden,
+            });
+            params.push(p);
+        }
+
+        // ---- order ---------------------------------------------------------
+        let graph = BodyGraph::new(scope_path.clone(), decls);
+        let order = match graph.order() {
+            Ok(order) => order,
+            Err(cycle) => {
+                self.error(param_cycle_diagnostic(&cycle));
+                return None;
+            }
+        };
+        // Register the body's nodes for the topology analysis. The edge of an
+        // instance `params:` binding is added by `stmt_instance` afterwards.
+        self.design.add_body(scope_path, graph.decls());
+
+        Some(PreparedParams {
+            params,
+            graph,
+            order,
+        })
+    }
+
+    /// Evaluate a body's parameters in the order the graph chose, installing
+    /// each value into `scope`.
+    ///
+    /// Calling this twice for one body is meaningful and intended: an instance
+    /// `params:` binding is the effective definition of the parameter it names
+    /// (contract §4.3), so every parameter whose definition reads a bound one
+    /// has to be evaluated again once the bindings are in scope.
+    fn evaluate_params(&mut self, prepared: &PreparedParams<'_>, scope: &mut Scope) {
+        let before = self.error_count;
+        for &index in &prepared.order {
+            if self.error_count > before {
+                // The first error stops the body, exactly as the statement walk
+                // does; carrying on would report noise from a broken scope.
+                return;
+            }
+            let overridden = prepared.graph.decls()[index].overridden;
+            self.evaluate_param(prepared.params[index], overridden, scope);
+        }
+    }
+
+    /// Evaluate one prepared declaration, in the order the graph chose.
+    fn evaluate_param(&mut self, p: &ast::ParamDecl, overridden: bool, scope: &mut Scope) {
+        let Some(default) = &p.default else {
+            // No default: the value must come from an override. If none does,
+            // reading the name reports it as undeclared.
+            return;
+        };
+
+        if overridden {
+            // The override is the effective definition, so the default is not
+            // evaluated as part of it and produces no diagnostic (contract
+            // §4.3). It is still evaluated best-effort for the two things an
+            // override cannot supply: the dimension an instance `params:`
+            // binding is checked against, and the fallback value a body's own
+            // scope would have had when nothing has provided one yet.
+            if let Ok(Value::Num(q)) = self.eval(default, scope) {
+                scope.defaults.insert(p.name.name.clone(), q);
+                if !scope.vars.contains_key(&p.name.name) {
+                    scope.set(&p.name.name, q, p.name.span);
+                }
+            }
+            return;
+        }
+
+        match self.eval(default, scope) {
+            Ok(Value::Num(q)) => {
+                self.check_finite(q, default.span, &p.name.name);
+                scope.defaults.insert(p.name.name.clone(), q);
+                scope.set(&p.name.name, q, p.name.span);
+            }
+            Ok(other) => self.error(
+                Diagnostic::error(
+                    Code::Type,
+                    format!(
+                        "parameter `{}` must be a number, found {}",
+                        p.name.name,
+                        other.type_name()
+                    ),
+                )
+                .at(default.span),
+            ),
+            Err(d) => self.error(d),
+        }
+    }
+
+    /// The names an expression reads that are parameters of the body it is
+    /// written in.
+    ///
+    /// A loop variable shadows a parameter of the same name for the duration of
+    /// one iteration, so the name written inside the loop is the variable, not
+    /// the parameter (dag-recon A6).
+    fn parameter_reads(&self, expr: &Expr) -> Vec<Read> {
+        let mut reads = Vec::new();
+        collect_reads(expr, &mut reads);
+        reads.retain(|read| !self.loop_vars.contains(&read.name));
+        reads
+    }
+
+    /// Record a topology use point: an expression the elaborator is about to
+    /// evaluate that decides what the design contains (contract §4.5).
+    ///
+    /// A use point whose expression reads no parameter is not recorded: a
+    /// constant can never be moved by a sweep.
+    fn note_use(
+        &mut self,
+        ctx: &Bodies,
+        kind: UseKind,
+        what: &str,
+        span: SourceSpan,
+        exprs: &[&Expr],
+    ) {
+        let mut reads = Vec::new();
+        for expr in exprs {
+            reads.extend(self.parameter_reads(expr));
+        }
+        if reads.is_empty() {
+            return;
+        }
+        self.design.add_use(UseSite {
+            scope: scope_path_of(ctx),
+            kind,
+            what: what.to_string(),
+            span,
+            reads,
+        });
+    }
+
+    /// Refuse a parameter sweep that would change the topology (contract §4.6).
+    ///
+    /// The sweep driver re-elaborates the design once per point, so a parameter
+    /// that reaches an `if` condition, a `for` iteration source or a computed
+    /// name removes, adds or rewires devices between points. Refusing it here,
+    /// during elaboration, is what makes `cdsl check` see it before a run; the
+    /// per-point comparison in the backend stays as the second defence.
+    fn check_swept_parameter(&mut self, name: &str, span: SourceSpan) {
+        let Some(path) = self.design.topology_path(&ScopePath::root(), name) else {
+            return;
+        };
+        self.error(topology_diagnostic(name, span, &path));
+    }
+
+    // -----------------------------------------------------------------------
     // Body execution
     // -----------------------------------------------------------------------
 
@@ -574,83 +937,35 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    fn stmt_param(&mut self, p: &ast::ParamDecl, scope: &mut Scope) {
-        if self.block_depth > 0 {
-            self.error(
-                Diagnostic::error(
-                    Code::Unsupported,
-                    "`param` declares a design parameter, so it belongs in the circuit body",
-                )
-                .at(p.span)
-                .with_note(
-                    "a parameter cannot be declared inside `for` or `if`: move it up, put the condition in the `value:` expression, or write one device statement per branch",
-                ),
-            );
+    /// A `param` statement reached while the body is running.
+    ///
+    /// Declarations at the top level of a body were already collected by
+    /// [`Elaborator::collect_params`] and evaluated by
+    /// [`Elaborator::evaluate_params`], so the only `param` that arrives here
+    /// is one written inside a `for`/`if` block — which the language
+    /// refuses, because a design parameter does not belong to elaboration-time
+    /// control flow (docs/repl.md §3).
+    fn stmt_param(&mut self, p: &ast::ParamDecl, _scope: &mut Scope) {
+        if self.block_depth == 0 {
+            // Handled by the pre-pass; visiting it again must not report the
+            // duplicate the pre-pass would have caught.
             return;
         }
-
-        if p.name.expr.is_some() {
-            self.error(
-                Diagnostic::error(Code::Type, "a parameter name must be written literally")
-                    .at(p.name.span)
-                    .with_note(
-                        "a computed name cannot be referred to by the expressions that use it",
-                    ),
-            );
-            return;
-        }
-
-        if !scope.declared.insert(p.name.name.clone()) {
-            self.error(
-                Diagnostic::error(
-                    Code::Duplicate,
-                    format!("parameter `{}` is declared twice", p.name.name),
-                )
-                .at(p.name.span)
-                .with_secondary(scope.span(&p.name.name), "first declared here"),
-            );
-            return;
-        }
-
-        // Record where this parameter was written, so a later duplicate can
-        // point back here even when an override supplied the value.
-        scope.spans.insert(p.name.name.clone(), p.name.span);
-
-        let Some(default) = &p.default else {
-            // No default: the value must come from an override. If it does
-            // not, reading the name reports it as undeclared.
-            return;
-        };
-
-        match self.eval(default, scope) {
-            Ok(Value::Num(q)) => {
-                self.check_finite(q, default.span, &p.name.name);
-                scope.defaults.insert(p.name.name.clone(), q);
-                // An override already supplied a value; the default only
-                // records the expected dimension.
-                if scope.vars.contains_key(&p.name.name) {
-                    return;
-                }
-                scope.set(&p.name.name, q, p.name.span);
-            }
-            Ok(other) => self.error(
-                Diagnostic::error(
-                    Code::Type,
-                    format!(
-                        "parameter `{}` must be a number, found {}",
-                        p.name.name,
-                        other.type_name()
-                    ),
-                )
-                .at(default.span),
+        self.error(
+            Diagnostic::error(
+                Code::Unsupported,
+                "`param` declares a design parameter, so it belongs in the circuit body",
+            )
+            .at(p.span)
+            .with_note(
+                "a parameter cannot be declared inside `for` or `if`: move it up, put the condition in the `value:` expression, or write one device statement per branch",
             ),
-            Err(d) => self.error(d),
-        }
+        );
     }
 
     fn stmt_node(&mut self, n: &ast::NodeDecl, scope: &mut Scope, ctx: &mut Bodies) {
         for name in &n.names {
-            let Some(local) = self.resolve_name(name, scope) else {
+            let Some(local) = self.resolve_name(name, scope, ctx, "node name") else {
                 continue;
             };
             if local == "gnd" || local == "0" {
@@ -698,7 +1013,7 @@ impl<'a> Elaborator<'a> {
     }
 
     fn stmt_device(&mut self, d: &ast::DeviceStmt, scope: &mut Scope, ctx: &mut Bodies) {
-        let Some(local) = self.resolve_name(&d.name, scope) else {
+        let Some(local) = self.resolve_name(&d.name, scope, ctx, "device name") else {
             return;
         };
         let name = ctx.qualify(&local);
@@ -964,7 +1279,7 @@ impl<'a> Elaborator<'a> {
             }
             _ => {
                 let sn = SpannedName::expressed(arg.value.clone(), arg.value.span);
-                self.resolve_name(&sn, scope)?
+                self.resolve_name(&sn, scope, ctx, "terminal name")?
             }
         };
         self.resolve_node(&local, arg.value.span, ctx)
@@ -1141,7 +1456,8 @@ impl<'a> Elaborator<'a> {
             return;
         }
 
-        let Some(instance_local) = self.resolve_name(&inst.name, scope) else {
+        let Some(instance_local) = self.resolve_name(&inst.name, scope, ctx, "instance name")
+        else {
             return;
         };
         let instance_name = ctx.qualify(&instance_local);
@@ -1221,32 +1537,28 @@ impl<'a> Elaborator<'a> {
         }
 
         // ---- parameter overrides -------------------------------------------
+        //
+        // The subcircuit body's declarations are collected and evaluated in
+        // dependency order first (contract §4.4), so a subcircuit may use a
+        // forward reference; the `params:` values below are written in the
+        // enclosing scope and replace the defaults they name (contract §4.3).
+        let inner_scope = scope_path_of(ctx).child(&instance_local);
+        let overridden: HashSet<String> = inst.params.iter().map(|e| e.key.clone()).collect();
         let mut inner = Scope::default();
-        let mut seen_defaults = HashSet::new();
-        for stmt in &def.body {
-            if let Stmt::Param(p) = stmt {
-                if !seen_defaults.insert(p.name.name.clone()) {
-                    continue;
-                }
-                if let Some(expr) = &p.default {
-                    match self.eval(expr, &mut inner) {
-                        Ok(Value::Num(q)) => inner.set(&p.name.name, q, p.name.span),
-                        Ok(other) => self.error(
-                            Diagnostic::error(
-                                Code::Type,
-                                format!(
-                                    "parameter `{}` must be a number, found {}",
-                                    p.name.name,
-                                    other.type_name()
-                                ),
-                            )
-                            .at(expr.span),
-                        ),
-                        Err(d) => self.error(d),
-                    }
-                }
-            }
+        let errors_before_params = self.error_count;
+        let Some(prepared) = self.collect_params(&def.body, &mut inner, &inner_scope, &overridden)
+        else {
+            return;
+        };
+        // The defaults come first: a binding may read one as its fallback and
+        // is checked against the dimension one carries.
+        self.evaluate_params(&prepared, &mut inner);
+        if self.error_count > errors_before_params {
+            return;
         }
+        // Every key a `param` declaration introduced is a key a `params:` entry
+        // may name; anything else is the typo reported below.
+        let seen_defaults = inner.declared.clone();
 
         // Instance parameter values are written in the *enclosing* scope, so
         // `params: { r: rstage }` may name a parameter of the parent circuit.
@@ -1282,7 +1594,12 @@ impl<'a> Elaborator<'a> {
                 ok = false;
                 continue;
             }
-            let previous = inner.get(&entry.key);
+            // The dimension an override must match comes from the default the
+            // override replaced; when a previous entry already supplied the
+            // key, that value is what this one has to agree with.
+            let previous = inner
+                .get(&entry.key)
+                .or_else(|| inner.defaults.get(&entry.key).copied());
             match self.eval(&entry.value, &mut eval_scope) {
                 Ok(Value::Num(q)) => {
                     // Dimension compatibility with the default, when there is one.
@@ -1303,8 +1620,18 @@ impl<'a> Elaborator<'a> {
                         ok = false;
                         continue;
                     }
+                    let binding_reads = self.parameter_reads(&entry.value);
                     inner.set(&entry.key, q, entry.key_span);
                     eval_scope.set(&entry.key, q, entry.key_span);
+                    // The one edge that crosses scopes: the instance-local
+                    // parameter now depends on the names this binding reads in
+                    // the parent scope (contract §4.1, §4.5).
+                    self.design.bind_from_parent(
+                        &inner_scope,
+                        &entry.key,
+                        &scope_path_of(ctx),
+                        &binding_reads,
+                    );
                 }
                 Ok(other) => {
                     self.error(
@@ -1331,6 +1658,16 @@ impl<'a> Elaborator<'a> {
             return;
         }
 
+        // Every binding is now in scope, and a binding *is* the effective
+        // definition of the parameter it names (contract §4.3), so a parameter
+        // that reads one has to be evaluated again with the final values —
+        // that is what "an override recomputes its dependents" means (plan
+        // §5.3).
+        self.evaluate_params(&prepared, &mut inner);
+        if self.error_count > errors_before_params {
+            return;
+        }
+
         // ---- recurse --------------------------------------------------------
         let mut inner_ctx = Bodies {
             prefix: {
@@ -1350,7 +1687,12 @@ impl<'a> Elaborator<'a> {
 
         self.stack.push(def_name.clone());
         let before = self.error_count;
+        // The parent body's loop variables are not visible inside the instance
+        // body, so a name written here that matches one of them is not shadowed
+        // by it.
+        let outer_loop_vars = std::mem::take(&mut self.loop_vars);
         self.run_body(&def.body, &mut inner, &mut inner_ctx);
+        self.loop_vars = outer_loop_vars;
         self.stack.pop();
 
         if self.error_count == before {
@@ -1365,30 +1707,42 @@ impl<'a> Elaborator<'a> {
 
     fn stmt_for(&mut self, f: &ast::ForStmt, scope: &mut Scope, ctx: &mut Bodies) {
         let items: Vec<Value> = match &f.iter {
-            ForIter::List(expr) => match self.eval(expr, scope) {
-                Ok(v) => match v.as_array() {
-                    Some(a) => a.to_vec(),
-                    None => {
-                        self.error(
-                            Diagnostic::error(
-                                Code::Type,
-                                format!(
-                                    "`for` over a list needs an array, found {}",
-                                    v.type_name()
-                                ),
-                            )
-                            .at(expr.span)
-                            .with_note("e.g. `for i in [1, 2, 3] do`"),
-                        );
+            ForIter::List(expr) => {
+                // The iteration source is a topology use point: it decides how
+                // many statements the loop expands into (contract §4.5).
+                self.note_use(ctx, UseKind::ForIteration, "", expr.span, &[expr]);
+                match self.eval(expr, scope) {
+                    Ok(v) => match v.as_array() {
+                        Some(a) => a.to_vec(),
+                        None => {
+                            self.error(
+                                Diagnostic::error(
+                                    Code::Type,
+                                    format!(
+                                        "`for` over a list needs an array, found {}",
+                                        v.type_name()
+                                    ),
+                                )
+                                .at(expr.span)
+                                .with_note("e.g. `for i in [1, 2, 3] do`"),
+                            );
+                            return;
+                        }
+                    },
+                    Err(d) => {
+                        self.error(d);
                         return;
                     }
-                },
-                Err(d) => {
-                    self.error(d);
-                    return;
                 }
-            },
+            }
             ForIter::Range { start, end } => {
+                self.note_use(
+                    ctx,
+                    UseKind::ForIteration,
+                    "",
+                    start.span.merge(end.span),
+                    &[start, end],
+                );
                 let (a, b) = match (self.eval(start, scope), self.eval(end, scope)) {
                     (Ok(a), Ok(b)) => (a, b),
                     (Err(d), _) | (_, Err(d)) => {
@@ -1451,42 +1805,53 @@ impl<'a> Elaborator<'a> {
             return;
         }
 
-        for item in items {
-            let previous = scope.get(&f.var.name);
-            match item {
-                Value::Num(q) => scope.set(&f.var.name, q, f.var.span),
-                other => {
-                    self.error(
-                        Diagnostic::error(
-                            Code::Type,
-                            format!(
-                                "loop variable `{}` must be a number, found {}",
-                                f.var.name,
-                                other.type_name()
-                            ),
-                        )
-                        .at(f.span),
-                    );
-                    return;
+        // The loop variable is in scope for the iterations only, so a computed
+        // name written inside the loop reads it and not a parameter of the same
+        // name (dag-recon A6).
+        self.loop_vars.push(f.var.name.clone());
+        'iterate: {
+            for item in items {
+                let previous = scope.get(&f.var.name);
+                match item {
+                    Value::Num(q) => scope.set(&f.var.name, q, f.var.span),
+                    other => {
+                        self.error(
+                            Diagnostic::error(
+                                Code::Type,
+                                format!(
+                                    "loop variable `{}` must be a number, found {}",
+                                    f.var.name,
+                                    other.type_name()
+                                ),
+                            )
+                            .at(f.span),
+                        );
+                        break 'iterate;
+                    }
                 }
-            }
-            self.block_depth += 1;
-            self.run_body(&f.body, scope, ctx);
-            self.block_depth -= 1;
-            if self.error_count > 0 {
-                return;
-            }
-            match previous {
-                Some(p) => scope.set(&f.var.name, p, f.var.span),
-                None => {
-                    scope.vars.remove(&f.var.name);
+                self.block_depth += 1;
+                self.run_body(&f.body, scope, ctx);
+                self.block_depth -= 1;
+                if self.error_count > 0 {
+                    break 'iterate;
+                }
+                match previous {
+                    Some(p) => scope.set(&f.var.name, p, f.var.span),
+                    None => {
+                        scope.vars.remove(&f.var.name);
+                    }
                 }
             }
         }
+        self.loop_vars.pop();
     }
 
     fn stmt_if(&mut self, s: &ast::IfStmt, scope: &mut Scope, ctx: &mut Bodies) {
         for (cond, body) in &s.arms {
+            // An `if` condition is a topology use point: it decides which
+            // statements exist, so a sweep that moves it changes the design
+            // (contract §4.5).
+            self.note_use(ctx, UseKind::IfCondition, "", cond.span, &[cond]);
             match self.eval(cond, scope) {
                 Ok(v) => match v.as_bool() {
                     Some(true) => {
@@ -1935,8 +2300,12 @@ impl<'a> Elaborator<'a> {
         circuit: &Circuit,
     ) -> Option<AnalysisPlan> {
         let mut tasks = Vec::new();
-        let mut measures = Vec::new();
         let mut pending_probes: Option<Vec<Expr>> = None;
+        // `derive` and `measure` statements are collected, not resolved here:
+        // which analysis `analysis: :ac2` names is only known once every
+        // analysis of the experiment has been read (contract §3).
+        let mut raw_derives: Vec<RawDerive<'_>> = Vec::new();
+        let mut raw_measures: Vec<RawMeasure<'_>> = Vec::new();
         let mut id = 0u32;
 
         let mut overrides = Vec::new();
@@ -1975,6 +2344,7 @@ impl<'a> Elaborator<'a> {
                     kind,
                     kind_span,
                     target,
+                    analysis,
                     span,
                 } => {
                     let Some(k) = MeasureKind::parse(kind) else {
@@ -1988,23 +2358,34 @@ impl<'a> Elaborator<'a> {
                         );
                         continue;
                     };
-                    if let Some(probe) = self.resolve_probe_expr(target, circuit, &mut []) {
-                        measures.push(MeasureRequest {
-                            name: name.name.clone(),
-                            kind: k,
-                            target: probe.probe,
-                            target_name: probe.name,
-                            span: *span,
-                            kind_span: *kind_span,
-                        });
-                    }
+                    raw_measures.push(RawMeasure {
+                        name,
+                        kind: k,
+                        kind_span: *kind_span,
+                        target,
+                        analysis: analysis.as_ref(),
+                        span: *span,
+                    });
                 }
+
+                ExpStmt::Derive {
+                    name,
+                    expr,
+                    analysis,
+                    span,
+                } => raw_derives.push(RawDerive {
+                    name,
+                    expr,
+                    analysis: analysis.as_ref(),
+                    span: *span,
+                }),
 
                 ExpStmt::Op { span } => {
                     tasks.push(AnalysisTask {
                         id: AnalysisId(id),
                         kind: AnalysisKind::Op,
                         probes: Vec::new(),
+                        implicit_probes: Vec::new(),
                         span: *span,
                     });
                     id += 1;
@@ -2016,6 +2397,7 @@ impl<'a> Elaborator<'a> {
                             id: AnalysisId(id),
                             kind,
                             probes: Vec::new(),
+                            implicit_probes: Vec::new(),
                             span: call.span,
                         });
                         id += 1;
@@ -2028,6 +2410,7 @@ impl<'a> Elaborator<'a> {
                             id: AnalysisId(id),
                             kind,
                             probes: Vec::new(),
+                            implicit_probes: Vec::new(),
                             span: call.span,
                         });
                         id += 1;
@@ -2040,6 +2423,7 @@ impl<'a> Elaborator<'a> {
                             id: AnalysisId(id),
                             kind,
                             probes: Vec::new(),
+                            implicit_probes: Vec::new(),
                             span: call.span,
                         });
                         id += 1;
@@ -2090,18 +2474,567 @@ impl<'a> Elaborator<'a> {
             task.probes = probes.clone();
         }
 
-        if self.error_count > 0 {
-            return None;
-        }
-
-        Some(AnalysisPlan {
+        // The skeleton carries the finished task list; the result requests
+        // are resolved against it, so `analysis_id_by_name` cannot disagree
+        // with the identity the backend stamps on a dataset.
+        let mut plan = AnalysisPlan {
             name: def.name.name.clone(),
             circuit_name: circuit.name.clone(),
             tasks,
             param_overrides: overrides,
-            measures,
+            derives: Vec::new(),
+            measures: Vec::new(),
             span: def.span,
+        };
+
+        // A derived signal and a measurement are both addressed by name, and
+        // a derived signal is a signal, so it also shares a namespace with
+        // the probes `save` exports.
+        let mut result_names: HashMap<String, (SourceSpan, &'static str)> = HashMap::new();
+
+        for raw in &raw_derives {
+            if !self.claim_result_name(raw.name, raw.span, "derived signal", &mut result_names) {
+                continue;
+            }
+            if let Some(saved) = probes.iter().find(|p| p.name == raw.name.name) {
+                self.error(
+                    Diagnostic::error(
+                        Code::Duplicate,
+                        format!(
+                            "`{}` is already saved as a probe, so it cannot name a \
+                             derived signal",
+                            raw.name.name
+                        ),
+                    )
+                    .at(raw.span)
+                    .with_secondary(saved.span, "saved here"),
+                );
+                continue;
+            }
+            let Some(expr) = self.lower_result_expr(raw.expr, circuit) else {
+                continue;
+            };
+            let Some(binding) =
+                self.resolve_analysis_binding(raw.analysis, &plan, "derive", raw.name, raw.span)
+            else {
+                continue;
+            };
+            // A derive always evaluates a new expression, so it never takes
+            // the legacy path — even when it is a bare probe read.
+            let read = expr.probes();
+            attach_implicit(&mut plan, binding, &read);
+            let source = expr.render();
+            plan.derives.push(DeriveRequest {
+                name: raw.name.name.clone(),
+                expr,
+                binding,
+                source,
+                span: raw.span,
+                name_span: raw.name.span,
+            });
+        }
+
+        for raw in &raw_measures {
+            if !self.claim_result_name(raw.name, raw.span, "measurement", &mut result_names) {
+                continue;
+            }
+            let Some(expr) = self.lower_result_expr(raw.target, circuit) else {
+                continue;
+            };
+            // The documented legacy rule, preserved exactly: a measure whose
+            // target is a lone probe and which writes no `analysis:` keeps
+            // searching analyses (TRAN -> AC -> DC -> OP). Which analysis it
+            // lands on is not known at check time, so the static reduction
+            // rules below cannot apply to it; the run-time path reports a
+            // reduction that finds no candidate at all.
+            let legacy = raw.analysis.is_none() && expr.is_plain_probe();
+            let binding = if legacy {
+                AnalysisBinding::LegacyPreferred
+            } else {
+                let Some(binding) = self.resolve_analysis_binding(
+                    raw.analysis,
+                    &plan,
+                    "measure",
+                    raw.name,
+                    raw.span,
+                ) else {
+                    continue;
+                };
+                binding
+            };
+            if !self.check_measure_reduction(&plan, raw, &expr, binding) {
+                continue;
+            }
+            // A legacy measure may read the signal from any analysis, so
+            // every task has to be able to produce it.
+            let read = expr.probes();
+            attach_implicit(&mut plan, binding, &read);
+            let source = expr.render();
+            plan.measures.push(MeasureRequest {
+                name: raw.name.name.clone(),
+                kind: raw.kind,
+                expr,
+                binding,
+                source,
+                span: raw.span,
+                kind_span: raw.kind_span,
+            });
+        }
+
+        // A run can drive exactly one parameter sweep: the driver re-elaborates
+        // and re-runs the design once per point and stitches the points into a
+        // single dataset, so with two sweeps the second one silently takes over
+        // the first one's identity and a binding written for the first is
+        // evaluated against the second (round-3 review B2). Rejecting it here
+        // keeps `cdsl check` honest about what a run can do, and closes the
+        // "joint multi-parameter sweep" that the documentation already calls
+        // unsupported.
+        let sweeps: Vec<&AnalysisTask> = plan
+            .tasks
+            .iter()
+            .filter(|t| is_parameter_sweep(t))
+            .collect();
+        if sweeps.len() > 1 {
+            let names: Vec<String> = sweeps
+                .iter()
+                .filter_map(|t| plan.result_name(t.id))
+                .collect();
+            self.error(
+                Diagnostic::error(
+                    Code::Unsupported,
+                    format!(
+                        "experiment `{}` declares {} parameter sweeps ({}); a run can drive only one",
+                        def.name.name,
+                        sweeps.len(),
+                        names.join(", ")
+                    ),
+                )
+                .at(sweeps[1].span)
+                .with_note(
+                    "a parameter sweep re-elaborates and re-runs the design once per point, so two \
+                     sweeps cannot share one run; put each sweep in its own experiment",
+                ),
+            );
+        }
+
+        if self.error_count > 0 {
+            return None;
+        }
+
+        Some(plan)
+    }
+
+    // ---- result expressions ----------------------------------------------
+
+    /// Lower a written result expression into the plan-layer IR.
+    ///
+    /// The structure is built by [`Elaborator::lower_result_node`]; a
+    /// dimension mismatch is a property of the whole expression, so it is
+    /// reported once, at the span the user wrote, rather than at every level
+    /// that contains it (contract §5).
+    fn lower_result_expr(&mut self, expr: &Expr, circuit: &Circuit) -> Option<ExprIr> {
+        let lowered = self.lower_result_node(expr, circuit)?;
+        if let Some(message) = lowered.static_dimension_error() {
+            self.error(Diagnostic::error(Code::Dimension, message).at(expr.span));
+            return None;
+        }
+        Some(lowered)
+    }
+
+    /// One node of a result expression.
+    ///
+    /// Every accepted form is listed here and nowhere else: a construct the
+    /// result IR has no node for is refused with `Type`, never silently
+    /// dropped (contract §5).
+    fn lower_result_node(&mut self, expr: &Expr, circuit: &Circuit) -> Option<ExprIr> {
+        match &expr.kind {
+            // A dimensionless literal broadcasts over the samples. A literal
+            // with a unit is a physical quantity, and there is no literal
+            // column in a dataset to put one in.
+            ExprKind::Int(v) => Some(ExprIr::Number(*v as f64)),
+            ExprKind::Float(v) => Some(ExprIr::Number(*v)),
+            ExprKind::Quantity(q) if q.dimension.is_dimensionless() => {
+                Some(ExprIr::Number(q.value))
+            }
+            ExprKind::Quantity(q) => {
+                self.error(
+                    Diagnostic::error(
+                        Code::Type,
+                        format!(
+                            "`{}` has the unit {}; a result expression takes a plain number",
+                            q.text, q.dimension
+                        ),
+                    )
+                    .at(expr.span)
+                    .with_note(
+                        "a result expression is a formula over probe reads, e.g. `v(:out) / 2`; \
+                         the unit comes from the signals",
+                    ),
+                );
+                None
+            }
+
+            // A bare name is a circuit parameter. It is not a signal, and a
+            // derived signal is not visible to another expression in this
+            // version (contract §1), so there is nothing it could resolve to.
+            ExprKind::Var(name) => {
+                self.error(
+                    Diagnostic::error(Code::Type, format!("`{name}` is not a signal"))
+                        .at(expr.span)
+                        .with_note("signals are written `v(:node)`, `v(:a, :b)` or `i(:device)`")
+                        .with_note(
+                            "a derived signal cannot be referenced by another result \
+                             expression in this version",
+                        ),
+                );
+                None
+            }
+
+            ExprKind::Bool(value) => {
+                self.reject_result_node(expr, format!("the boolean `{value}`"))
+            }
+            ExprKind::Str(_) => self.reject_result_node(expr, "a string"),
+            ExprKind::Symbol(name) => {
+                self.reject_result_node(expr, format!("the bare symbol `:{name}`"))
+            }
+            ExprKind::Array(_) => self.reject_result_node(expr, "an array"),
+            ExprKind::Dict(_) => self.reject_result_node(expr, "a dictionary"),
+
+            // Unary `+` is a no-op on a sample: dropping it is what makes
+            // `+v(:out)` and `v(:out)` the same request.
+            ExprKind::Unary { op, rhs } => match op {
+                UnaryOp::Pos => self.lower_result_node(rhs, circuit),
+                UnaryOp::Neg => self
+                    .lower_result_node(rhs, circuit)
+                    .map(|inner| ExprIr::Neg(Box::new(inner))),
+                UnaryOp::Not => self.reject_result_node(expr, "the boolean negation `!`"),
+            },
+
+            ExprKind::Binary { op, lhs, rhs } => {
+                // Comparisons and boolean logic produce a truth value, and a
+                // result expression is a number per sample.
+                if !matches!(
+                    op,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                ) {
+                    let what = if op.is_comparison() {
+                        "a comparison"
+                    } else {
+                        "boolean logic"
+                    };
+                    self.error(
+                        Diagnostic::error(
+                            Code::Type,
+                            format!(
+                                "`{}` ({what}) is not available in a result expression",
+                                op.symbol()
+                            ),
+                        )
+                        .at(expr.span)
+                        .with_note(RESULT_FUNCTIONS),
+                    );
+                    return None;
+                }
+                // Both sides are lowered before giving up, so one run reports
+                // every independent mistake in the expression.
+                let a = self.lower_result_node(lhs, circuit);
+                let b = self.lower_result_node(rhs, circuit);
+                let (a, b) = (a?, b?);
+                let (left, right) = (Box::new(a), Box::new(b));
+                Some(match op {
+                    BinaryOp::Add => ExprIr::Add(left, right),
+                    BinaryOp::Sub => ExprIr::Sub(left, right),
+                    BinaryOp::Mul => ExprIr::Mul(left, right),
+                    BinaryOp::Div => ExprIr::Div(left, right),
+                    // Every other operator was refused above.
+                    _ => return None,
+                })
+            }
+
+            ExprKind::Call(call) => self.lower_result_call(expr, call, circuit),
+        }
+    }
+
+    /// The function forms of a result expression.
+    fn lower_result_call(&mut self, expr: &Expr, call: &Call, circuit: &Circuit) -> Option<ExprIr> {
+        // Every accepted form takes positional arguments; a named one would
+        // otherwise be read as an empty argument list.
+        if !call.named.is_empty() {
+            self.error(
+                Diagnostic::error(
+                    Code::Argument,
+                    format!("`{}` takes positional arguments only", call.name),
+                )
+                .at(call.span)
+                .with_note("write `min(v(:a), v(:b))`, not `min(a: ..., b: ...)`"),
+            );
+            return None;
+        }
+
+        // Probe reads keep the `save` resolution rules: the same lookup, the
+        // same canonical name (`v(a,b)`), the same diagnostics for an unknown
+        // node or device.
+        if matches!(call.name.as_str(), "v" | "i") {
+            let probe = self.resolve_probe_expr(expr, circuit, &mut [])?;
+            return Some(ExprIr::Probe(ProbeRef::new(
+                probe.name,
+                probe.probe,
+                probe.span,
+            )));
+        }
+
+        let arity = match call.name.as_str() {
+            "abs" | "sqrt" => 1,
+            "min" | "max" | "gain_db" => 2,
+            other => {
+                self.error(
+                    Diagnostic::error(
+                        Code::Name,
+                        format!("unknown function `{other}` in a result expression"),
+                    )
+                    .at(call.name_span)
+                    .with_note(RESULT_FUNCTIONS),
+                );
+                return None;
+            }
+        };
+        if call.positional.len() != arity {
+            self.error(
+                Diagnostic::error(
+                    Code::Argument,
+                    format!(
+                        "`{}` takes {arity} argument(s), found {}",
+                        call.name,
+                        call.positional.len()
+                    ),
+                )
+                .at(call.span)
+                .with_note(format!("usage: {}", result_function_usage(&call.name))),
+            );
+            return None;
+        }
+
+        // Lower every argument before giving up, so `min(nope, 1)` and
+        // `min(1, nope)` are both reported.
+        let lowered: Vec<Option<ExprIr>> = call
+            .positional
+            .iter()
+            .map(|arg| self.lower_result_node(arg, circuit))
+            .collect();
+        let lowered = lowered.into_iter().collect::<Option<Vec<_>>>()?;
+        let mut rest = lowered.into_iter();
+        let first = rest.next()?;
+        let second = rest.next();
+        Some(match (call.name.as_str(), second) {
+            ("abs", _) => ExprIr::Abs(Box::new(first)),
+            ("sqrt", _) => ExprIr::Sqrt(Box::new(first)),
+            ("min", Some(b)) => ExprIr::Min(Box::new(first), Box::new(b)),
+            ("max", Some(b)) => ExprIr::Max(Box::new(first), Box::new(b)),
+            ("gain_db", Some(b)) => ExprIr::GainDb {
+                numerator: Box::new(first),
+                denominator: Box::new(b),
+            },
+            // The arity table above accepts no other shape.
+            _ => return None,
         })
+    }
+
+    /// Refuse a node that is not part of a result expression.
+    fn reject_result_node<T>(&mut self, expr: &Expr, description: impl Into<String>) -> Option<T> {
+        self.error(
+            Diagnostic::error(
+                Code::Type,
+                format!("{} is not a result expression", description.into()),
+            )
+            .at(expr.span)
+            .with_note(RESULT_FUNCTIONS),
+        );
+        None
+    }
+
+    // ---- binding and dependencies ----------------------------------------
+
+    /// Claim the name of a derived signal or a measurement.
+    ///
+    /// A derived signal and a measurement are both addressed by name, and a
+    /// derived signal is a signal, so all three namespaces collide with each
+    /// other (contract §5). Returns `false` when the name cannot be used, so
+    /// the caller skips the statement instead of installing a nameless
+    /// result. A collision is reported at the statement, because the
+    /// duplicate is a property of the statement and not of one token in it.
+    fn claim_result_name(
+        &mut self,
+        name: &SpannedName,
+        statement_span: SourceSpan,
+        what: &'static str,
+        names: &mut HashMap<String, (SourceSpan, &'static str)>,
+    ) -> bool {
+        // A computed name would be the empty string by the time it is used,
+        // so it is refused the same way `param` refuses one.
+        if name.expr.is_some() {
+            self.error(
+                Diagnostic::error(
+                    Code::Type,
+                    format!("a {what} name must be written literally"),
+                )
+                .at(name.span)
+                .with_note("the name identifies the result, so it cannot be computed"),
+            );
+            return false;
+        }
+        if name.name.is_empty() {
+            self.error(
+                Diagnostic::error(Code::Value, format!("a {what} needs a name"))
+                    .at(name.span)
+                    .with_note("write `:name`, as in `derive :gain, expr: ...`"),
+            );
+            return false;
+        }
+        if let Some((first, first_kind)) = names.get(&name.name) {
+            let (first, first_kind) = (*first, *first_kind);
+            self.error(
+                Diagnostic::error(
+                    Code::Duplicate,
+                    format!("`{}` is already defined as a {first_kind}", name.name),
+                )
+                .at(statement_span)
+                .with_secondary(first, "first defined here"),
+            );
+            return false;
+        }
+        names.insert(name.name.clone(), (statement_span, what));
+        true
+    }
+
+    /// Decide which analysis a result expression is evaluated on (contract §3).
+    ///
+    /// Returns `None` after reporting why the statement cannot be resolved;
+    /// the task list is complete by the time this runs, which is what makes
+    /// `analysis: :ac2` mean the second AC analysis of the experiment.
+    fn resolve_analysis_binding(
+        &mut self,
+        written: Option<&SpannedName>,
+        plan: &AnalysisPlan,
+        what: &str,
+        name: &SpannedName,
+        span: SourceSpan,
+    ) -> Option<AnalysisBinding> {
+        if let Some(id) = written {
+            let Some(text) = id.literal() else {
+                self.error(
+                    Diagnostic::error(
+                        Code::Type,
+                        format!("the analysis of `{}` must be written literally", name.name),
+                    )
+                    .at(id.span)
+                    .with_note("an analysis identity is not computed; write `analysis: :ac1`"),
+                );
+                return None;
+            };
+            let Some(task) = plan.analysis_id_by_name(text) else {
+                let available = plan.analysis_names();
+                let first = available.first().map(String::as_str).unwrap_or("ac1");
+                self.error(
+                    Diagnostic::error(
+                        Code::Name,
+                        format!("`{text}` is not an analysis of this experiment"),
+                    )
+                    .at(id.span)
+                    .with_note(format!("available analyses: {}", available.join(", ")))
+                    .with_note(format!(
+                        "an analysis identity is `{{kind}}{{ordinal}}`, e.g. `:{first}`"
+                    )),
+                );
+                return None;
+            };
+            return Some(AnalysisBinding::Analysis(task));
+        }
+
+        // No `analysis:` written: one analysis is unambiguous, several are
+        // not, and guessing from whichever run happens to succeed is exactly
+        // what the contract forbids.
+        match plan.tasks.as_slice() {
+            [only] => Some(AnalysisBinding::Analysis(only.id)),
+            many => {
+                let available = plan.analysis_names();
+                let first = available.first().map(String::as_str).unwrap_or("ac1");
+                self.error(
+                    Diagnostic::error(
+                        Code::Ambiguous,
+                        format!(
+                            "`{}` could be evaluated on any of {} analyses, so this {what} \
+                             needs `analysis:`",
+                            name.name,
+                            many.len()
+                        ),
+                    )
+                    .at(span)
+                    .with_note(format!("available analyses: {}", available.join(", ")))
+                    .with_note(format!("add `analysis: :{first}` to choose one")),
+                );
+                None
+            }
+        }
+    }
+
+    /// The static rejections the contract requires for a reduction.
+    ///
+    /// Returns `false` when the reduction cannot apply to the analysis it was
+    /// bound to, so the caller skips the statement. A `LegacyPreferred`
+    /// measure is exempt from both rules: which analysis it lands on is not
+    /// known until run time, where a reduction that finds no candidate is
+    /// reported instead.
+    fn check_measure_reduction(
+        &mut self,
+        plan: &AnalysisPlan,
+        raw: &RawMeasure<'_>,
+        expr: &ExprIr,
+        binding: AnalysisBinding,
+    ) -> bool {
+        let AnalysisBinding::Analysis(id) = binding else {
+            return true;
+        };
+        let Some(task) = plan.task(id) else {
+            return true;
+        };
+        let analysis = plan.result_name(id).unwrap_or_else(|| "?".to_string());
+        // `avg` and `rms` are integrals over time, so an analysis with no time
+        // axis (op, dc, ac) cannot support them (contract §5).
+        if raw.kind.needs_time_axis() && !matches!(task.kind, AnalysisKind::Tran(_)) {
+            self.error(
+                Diagnostic::error(
+                    Code::Type,
+                    format!(
+                        "`{}` needs a time axis, but analysis `{analysis}` has none",
+                        raw.kind.name()
+                    ),
+                )
+                .at(raw.kind_span)
+                .with_note("bind it to a transient analysis, e.g. `analysis: :tran1`"),
+            );
+            return false;
+        }
+        // An AC sample is complex and the language has no implicit magnitude
+        // ordering, so `max`/`min` must be handed something already real.
+        if matches!(raw.kind, MeasureKind::Max | MeasureKind::Min)
+            && matches!(task.kind, AnalysisKind::Ac(_))
+            && !expr.is_statically_real()
+        {
+            self.error(
+                Diagnostic::error(
+                    Code::Type,
+                    format!(
+                        "`{}` of `{}` is not ordered: the samples of `{analysis}` are complex",
+                        raw.kind.name(),
+                        expr.render()
+                    ),
+                )
+                .at(raw.kind_span)
+                .with_note("apply `abs(...)` first, e.g. `max: abs(v(:out))`"),
+            );
+            return false;
+        }
+        true
     }
 
     /// The name a probe argument refers to.
@@ -2566,6 +3499,12 @@ impl<'a> Elaborator<'a> {
                 // A swept parameter must exist somewhere in the design; the
                 // authoritative check happens when the point is elaborated,
                 // but a typo is worth catching here.
+                //
+                // A parameter that reaches a topology use point would add,
+                // remove or rewire devices between sweep points, which is
+                // refused here so that `cdsl check` sees it before a run
+                // (contract §4.6).
+                self.check_swept_parameter(sym, a.value.span);
                 (
                     SweepTarget::Parameter {
                         name: sym.to_string(),
@@ -2862,6 +3801,139 @@ fn ambiguous_paths<'a>(
         .map(|(_, full)| full)
         .collect();
     (paths.len() > 1).then_some(paths)
+}
+
+/// Every bare name an expression reads, in source order.
+///
+/// Only `Var`s: a symbol is a name the language resolves elsewhere and a call
+/// name is a function, so neither is a parameter reference. The span is the
+/// reference's own, which is what a cycle or an explanation path points at.
+fn collect_reads(expr: &Expr, out: &mut Vec<Read>) {
+    match &expr.kind {
+        ExprKind::Var(name) => out.push(Read {
+            name: name.clone(),
+            span: expr.span,
+        }),
+        ExprKind::Array(items) => {
+            for item in items {
+                collect_reads(item, out);
+            }
+        }
+        ExprKind::Dict(entries) => {
+            for entry in entries {
+                collect_reads(&entry.value, out);
+            }
+        }
+        ExprKind::Unary { rhs, .. } => collect_reads(rhs, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_reads(lhs, out);
+            collect_reads(rhs, out);
+        }
+        ExprKind::Call(call) => {
+            for arg in &call.positional {
+                collect_reads(arg, out);
+            }
+            for arg in &call.named {
+                collect_reads(&arg.value, out);
+            }
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Quantity(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Str(_)
+        | ExprKind::Symbol(_) => {}
+    }
+}
+
+/// The names one definition expression reads.
+fn reads_of(expr: &Expr) -> Vec<Read> {
+    let mut out = Vec::new();
+    collect_reads(expr, &mut out);
+    out
+}
+
+/// The body instance a statement is being elaborated in.
+fn scope_path_of(ctx: &Bodies) -> ScopePath {
+    let mut path = ScopePath::root();
+    for segment in &ctx.prefix {
+        path = path.child(segment);
+    }
+    path
+}
+
+/// The `E_PARAM_CYCLE` diagnostic for a closed dependency path (contract §4.4).
+///
+/// The primary span is the reference that closes the path (inside the
+/// declaration whose definition reads back to the start) and every participating
+/// declaration gets a secondary label, so a cycle is always locatable.
+fn param_cycle_diagnostic(cycle: &Cycle) -> Diagnostic {
+    let path = cycle.render_path();
+    let message = match cycle.steps.as_slice() {
+        [only] => format!(
+            "parameter `{}` depends on its own definition: {path}",
+            only.name
+        ),
+        _ => format!("these parameters depend on each other: {path}"),
+    };
+    let mut d = Diagnostic::error(Code::ParamCycle, message)
+        .at(cycle.primary_span())
+        .with_note(
+            "the path is the chain of `param` defaults that reads back to where it started; \
+             give one of them a value through an instance `params:` binding or an \
+             experiment override to break it",
+        );
+    for step in &cycle.steps {
+        d = d.with_secondary(
+            step.decl_span,
+            format!("`{}` takes part in the cycle", step.name),
+        );
+    }
+    d
+}
+
+/// The `E_TOPO_PARAM` diagnostic for a sweep that would change the topology
+/// (contract §4.6).
+///
+/// The message carries the explanation path swept parameter -> intermediate
+/// parameter(s) -> topology use point, and every step is a located label, so the
+/// user can see where each dependency on the path is written.
+fn topology_diagnostic(name: &str, span: SourceSpan, path: &[PathStep]) -> Diagnostic {
+    let mut d = Diagnostic::error(
+        Code::TopologyParam,
+        format!("parameter `{name}` reaches a topology use point, so it cannot be swept"),
+    )
+    .at(span)
+    .with_context("path", crate::param_graph::render_path(path))
+    .with_note(
+        "a plain value sweep is still allowed: a parameter that only reaches `value:`, `dc:`, \
+         `ac:`, `waveform:` or model positions changes no device, node or connection",
+    )
+    .with_note("the topology comparison each sweep point already runs stays as a second defence");
+
+    for (index, step) in path.iter().enumerate() {
+        match step {
+            PathStep::Param {
+                name,
+                decl_span,
+                read_span: _,
+            } if index == 0 => {
+                d = d.with_secondary(*decl_span, format!("`{name}` is the swept parameter"));
+            }
+            PathStep::Param {
+                name, decl_span, ..
+            } => {
+                d = d.with_secondary(
+                    *decl_span,
+                    format!("`{name}` follows from the swept parameter"),
+                );
+            }
+            PathStep::Use { description, span } => {
+                d = d.with_secondary(*span, format!("topology use point: {description}"));
+            }
+        }
+    }
+    d
 }
 
 /// Look a device up by its local or full hierarchical name.

@@ -12,6 +12,7 @@
 //! diagnostics rather than one.
 
 use circuit_core::diagnostic::{Code, Diagnostic, Diagnostics};
+use circuit_core::limits::MAX_EXPR_DEPTH;
 use circuit_core::span::SourceSpan;
 
 use crate::ast::{
@@ -124,7 +125,7 @@ fn body_only_keyword(word: &str) -> Option<&'static str> {
     Some(match word {
         "param" | "node" | "instance" | "model" | "resistor" | "capacitor" | "inductor"
         | "voltage_source" | "current_source" | "diode" | "for" | "if" => "circuit",
-        "op" | "dc" | "ac" | "tran" | "save" | "measure" => "experiment",
+        "op" | "dc" | "ac" | "tran" | "save" | "measure" | "derive" => "experiment",
         "do" | "end" | "else" | "elsif" | "in" => "block",
         _ => return None,
     })
@@ -178,6 +179,12 @@ struct Parser<'a> {
     /// Set when an error is reported while the cursor is at the end of the
     /// input, i.e. when the failure could be caused by the text stopping.
     ran_out: bool,
+    /// How deep the expression currently being parsed is nested.
+    ///
+    /// The parser recurses once per nesting level (a parenthesised group, a
+    /// call argument, a unary operator), so this counter is the one place
+    /// that can stop it: see `MAX_EXPR_DEPTH`.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -187,6 +194,7 @@ impl<'a> Parser<'a> {
             pos: 0,
             diagnostics: Diagnostics::new(),
             ran_out: false,
+            depth: 0,
         }
     }
 
@@ -546,6 +554,34 @@ impl<'a> Parser<'a> {
             }
         }
         Some(items)
+    }
+
+    /// The optional trailing `, analysis: :ac1` of `derive` and `measure`.
+    ///
+    /// Returns the whole argument when nothing followed the comma, or when a
+    /// trailing comma was written and the statement ends there — the same
+    /// tolerances `arg_list` gives every other statement. The inner `Option`
+    /// is the identity itself: `None` means "not written", and the outer
+    /// `None` means "written but malformed".
+    fn optional_analysis_arg(&mut self, statement: &str) -> Option<Option<SpannedName>> {
+        if !self.eat(&TokenKind::Comma) {
+            return Some(None);
+        }
+        self.skip_newlines();
+        if self.at_stmt_end() {
+            return Some(None);
+        }
+        let (label, label_span) = self.arg_label()?;
+        if label != "analysis" {
+            let message = format!(
+                "unexpected argument `{label}`; `{statement}` takes `analysis: :<id>` only \
+                 after the rest of the statement"
+            );
+            return self.error(label_span, message);
+        }
+        let id =
+            self.expect_symbol("an analysis identity after `analysis:`, as in `analysis: :ac1`")?;
+        Some(Some(id))
     }
 
     // ---- top level -------------------------------------------------------
@@ -1299,7 +1335,7 @@ impl<'a> Parser<'a> {
         let Some(word) = self.ident_text().map(str::to_string) else {
             let token = self.current().clone();
             let message = format!(
-                "unexpected {}; expected a statement such as `op` or `save`",
+                "unexpected {}; expected a statement such as `op`, `save`, or `derive`",
                 token.kind.describe()
             );
             self.report(token.span, message);
@@ -1360,13 +1396,48 @@ impl<'a> Parser<'a> {
                 self.skip_newlines();
                 let (kind, kind_span) = self.arg_label()?;
                 let target = self.expr()?;
-                let span = keyword.span.merge(target.span);
+                let analysis = self.optional_analysis_arg("measure")?;
+                let span = keyword.span.merge(self.prev_end());
                 self.finish_stmt()?;
                 Some(ExpStmt::Measure {
                     name,
                     kind,
                     kind_span,
                     target,
+                    analysis,
+                    span,
+                })
+            }
+            "derive" => {
+                let keyword = self.bump();
+                let name = self.expect_symbol(
+                    "a signal name after `derive`, as in `derive :gain, expr: v(:out) / v(:in)`",
+                )?;
+                if !self.eat(&TokenKind::Comma) {
+                    let span = self.span();
+                    return self.error(
+                        span,
+                        "expected `, expr: <expression>` after `derive :name`, as in \
+                         `derive :gain, expr: v(:out) / v(:in)`",
+                    );
+                }
+                self.skip_newlines();
+                let (label, label_span) = self.arg_label()?;
+                if label != "expr" {
+                    let message = format!(
+                        "unexpected argument `{label}`; `derive` takes `expr: <expression>` \
+                         first, and `analysis:` after it"
+                    );
+                    return self.error(label_span, message);
+                }
+                let expr = self.expr()?;
+                let analysis = self.optional_analysis_arg("derive")?;
+                let span = keyword.span.merge(self.prev_end());
+                self.finish_stmt()?;
+                Some(ExpStmt::Derive {
+                    name,
+                    expr,
+                    analysis,
                     span,
                 })
             }
@@ -1393,7 +1464,7 @@ impl<'a> Parser<'a> {
                 let token = self.current().clone();
                 let message = format!(
                     "unexpected `{other}`; expected an experiment statement (`op`, `dc`, `ac`, \
-                     `tran`, `save`, `param`, or `measure`)"
+                     `tran`, `save`, `param`, `measure`, or `derive`)"
                 );
                 self.report(token.span, message);
                 self.bump();
@@ -1415,7 +1486,84 @@ impl<'a> Parser<'a> {
     // ---- expressions -----------------------------------------------------
 
     fn expr(&mut self) -> Option<Expr> {
-        self.binary(1)
+        // A nested call (inside parentheses or an argument list) is already
+        // covered by the caller's check; only a finished *top-level*
+        // expression is measured here, so each written expression is walked
+        // once and the cost stays linear.
+        let nested = self.depth > 0;
+        let parsed = self.binary(1)?;
+        if !nested && !self.check_expression_depth(&parsed) {
+            return None;
+        }
+        Some(parsed)
+    }
+
+    /// Refuse an expression whose *shape* is deeper than the limit.
+    ///
+    /// Nesting is bounded while parsing (see [`Parser::unary`]); this bounds the
+    /// finished tree, which is what every later pass recurses over —
+    /// elaboration, dimension analysis, evaluation and rendering. A flat chain
+    /// such as `a * b * c * ...` is not nested, but its tree is still one node
+    /// deep per operand, so measuring the tree (and not the nesting) is what
+    /// keeps those passes from running the stack out (round-4 FINDING-1).
+    ///
+    /// The walk uses an explicit stack: the guard itself must not be able to
+    /// overflow.
+    fn check_expression_depth(&mut self, expr: &Expr) -> bool {
+        let mut stack: Vec<(&Expr, usize)> = vec![(expr, 1)];
+        let mut deepest = 1usize;
+        while let Some((node, depth)) = stack.pop() {
+            if depth > deepest {
+                deepest = depth;
+                if deepest > MAX_EXPR_DEPTH {
+                    break;
+                }
+            }
+            let child = depth + 1;
+            match &node.kind {
+                ExprKind::Unary { rhs, .. } => stack.push((rhs, child)),
+                ExprKind::Binary { lhs, rhs, .. } => {
+                    stack.push((lhs, child));
+                    stack.push((rhs, child));
+                }
+                ExprKind::Call(call) => {
+                    for argument in &call.positional {
+                        stack.push((argument, child));
+                    }
+                    for argument in &call.named {
+                        stack.push((&argument.value, child));
+                    }
+                }
+                ExprKind::Array(items) => {
+                    for item in items {
+                        stack.push((item, child));
+                    }
+                }
+                ExprKind::Dict(entries) => {
+                    for entry in entries {
+                        stack.push((&entry.value, child));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if deepest <= MAX_EXPR_DEPTH {
+            return true;
+        }
+        let span = expr.span;
+        self.diagnostics.push(
+            Diagnostic::error(
+                Code::Limit,
+                format!(
+                    "expression is {deepest} levels deep, which is deeper than the {MAX_EXPR_DEPTH} level limit"
+                ),
+            )
+            .at(span)
+            .with_note(
+                "the depth counts every operand and operator; split the expression into several named parameters to go deeper",
+            ),
+        );
+        false
     }
 
     /// Precedence climbing over the table in `docs/language.md` §2.1; every
@@ -1457,7 +1605,37 @@ impl<'a> Parser<'a> {
         Some(lhs)
     }
 
+    /// Parse one unary expression, bounding the parser's recursion.
+    ///
+    /// Every nested expression — a `-x` chain, a parenthesised group, a call
+    /// argument — reaches the parser through here, so one counter bounds all
+    /// of them. Deeper input is refused with `E_LIMIT` instead of exhausting
+    /// the stack (round-4 FINDING-1: 150 nested parentheses aborted the
+    /// process with no diagnostic before this guard existed).
     fn unary(&mut self) -> Option<Expr> {
+        if self.depth > MAX_EXPR_DEPTH {
+            let span = self.span();
+            self.diagnostics.push(
+                Diagnostic::error(
+                    Code::Limit,
+                    format!(
+                        "expression nests deeper than {MAX_EXPR_DEPTH} levels; the parser stops here"
+                    ),
+                )
+                .at(span)
+                .with_note(
+                    "nesting counts parentheses, call arguments and unary operators; split the expression into named parameters to go deeper",
+                ),
+            );
+            return None;
+        }
+        self.depth += 1;
+        let parsed = self.unary_inner();
+        self.depth -= 1;
+        parsed
+    }
+
+    fn unary_inner(&mut self) -> Option<Expr> {
         let op = match self.kind() {
             TokenKind::Minus => UnaryOp::Neg,
             TokenKind::Plus => UnaryOp::Pos,
@@ -1872,6 +2050,93 @@ end
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-12 * b.abs().max(1.0)
+    }
+
+    /// Parse on the stack size production gives the work (`cdsl` runs every
+    /// subcommand on a 64 MiB stack). The interesting deep inputs would
+    /// otherwise exhaust the test harness's own thread stack before the depth
+    /// guard can speak, which is what makes this a *guard* test and not a
+    /// stack-size test.
+    fn parse_errors_on_a_work_stack(src: &str) -> Diagnostics {
+        let owned = src.to_string();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || parse_errors(&owned))
+            .expect("the work thread must start")
+            .join()
+            .expect("the parser must report instead of aborting")
+    }
+
+    /// A parameter default deeper than the limit is a diagnostic, never a
+    /// stack overflow (round-4 FINDING-1: 150 nested parentheses used to abort
+    /// the process with no output at all).
+    #[test]
+    fn an_expression_deeper_than_the_limit_is_refused() {
+        let nested = format!(
+            "circuit :c do\n  node :a\n  param :p, default: {}2{}\nend\n",
+            "abs(".repeat(MAX_EXPR_DEPTH + 40),
+            ")".repeat(MAX_EXPR_DEPTH + 40)
+        );
+        let diagnostics = parse_errors_on_a_work_stack(&nested);
+        assert!(
+            diagnostics.iter().any(|d| d.code == Code::Limit),
+            "{:?}",
+            messages(&diagnostics)
+        );
+
+        // The same input written as an explicit nesting of parentheses.
+        let parens = format!(
+            "circuit :c do\n  node :a\n  param :p, default: {}2{}\nend\n",
+            "(".repeat(MAX_EXPR_DEPTH + 40),
+            ")".repeat(MAX_EXPR_DEPTH + 40)
+        );
+        let diagnostics = parse_errors_on_a_work_stack(&parens);
+        assert!(
+            diagnostics.iter().any(|d| d.code == Code::Limit),
+            "{:?}",
+            messages(&diagnostics)
+        );
+
+        // And a nesting that is deep but still inside the limit is accepted on
+        // that same stack.
+        let ok = format!(
+            "circuit :c do\n  node :a\n  param :p, default: {}2{}\nend\n",
+            "abs(".repeat(MAX_EXPR_DEPTH - 8),
+            ")".repeat(MAX_EXPR_DEPTH - 8)
+        );
+        let parsed = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || parse_source(&ok).circuits.len())
+            .expect("the work thread must start")
+            .join()
+            .expect("an in-limit nesting must parse");
+        assert_eq!(parsed, 1);
+    }
+
+    /// A flat chain is not nested, but its tree is still one node per operand:
+    /// the limit counts the tree, so the boundary sits at the limit itself.
+    #[test]
+    fn a_flat_chain_at_the_limit_parses_and_one_past_it_does_not() {
+        let at_limit = (0..MAX_EXPR_DEPTH)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        parse_source(&format!(
+            "circuit :c do\n  node :a\n  param :p, default: {at_limit}\nend\n"
+        ));
+
+        let past_limit = (0..=MAX_EXPR_DEPTH)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let diagnostics = parse_errors(&format!(
+            "circuit :c do\n  node :a\n  param :p, default: {past_limit}\nend\n"
+        ));
+        assert!(
+            diagnostics.iter().any(|d| d.code == Code::Limit),
+            "{:?}",
+            messages(&diagnostics)
+        );
     }
 
     /// The `default:`/`value:` expression of a device argument.
@@ -2530,19 +2795,22 @@ experiment :e, circuit: :x do
   tran start: 10.us, stop: 30.us, max_step: 50.ns
   param :r, value: 2.kohm
   measure :vmax, max: v(:out)
-  measure :vavg, avg: v(:out)
+  measure :vavg, avg: v(:out), analysis: :tran1
+  derive :ratio, expr: v(:vout) / v(:vin)
+  derive :gain_db, expr: gain_db(v(:vout), v(:vin)), analysis: :ac1
   save v(:vin), v(:vout), v(:a, :b), i(:input)
 end
 "#;
         let program = parse_source(src);
         let experiment = program.experiment("e").expect("the experiment");
-        assert_eq!(experiment.body.len(), 11);
+        assert_eq!(experiment.body.len(), 13);
 
         let keywords: Vec<&str> = experiment.body.iter().map(ExpStmt::keyword).collect();
         assert_eq!(
             keywords,
             [
-                "op", "dc", "dc", "ac", "ac", "tran", "tran", "param", "measure", "measure", "save"
+                "op", "dc", "dc", "ac", "ac", "tran", "tran", "param", "measure", "measure",
+                "derive", "derive", "save"
             ]
         );
 
@@ -2583,7 +2851,42 @@ end
         assert_eq!(kind, "max");
         assert!(matches!(target.kind, ExprKind::Call(_)));
 
-        let ExpStmt::Save { probes, .. } = &experiment.body[10] else {
+        let ExpStmt::Measure {
+            name,
+            kind,
+            analysis,
+            ..
+        } = &experiment.body[9]
+        else {
+            panic!("expected a measurement")
+        };
+        assert_eq!(name.name, "vavg");
+        assert_eq!(kind, "avg");
+        assert_eq!(analysis.as_ref().expect("an analysis").name, "tran1");
+
+        let ExpStmt::Derive { name, analysis, .. } = &experiment.body[10] else {
+            panic!("expected a derive")
+        };
+        assert_eq!(name.name, "ratio");
+        assert!(analysis.is_none(), "no binding written means none parsed");
+
+        let ExpStmt::Derive {
+            name,
+            expr,
+            analysis,
+            ..
+        } = &experiment.body[11]
+        else {
+            panic!("expected a derive")
+        };
+        assert_eq!(name.name, "gain_db");
+        assert_eq!(analysis.as_ref().expect("an analysis").name, "ac1");
+        let ExprKind::Call(call) = &expr.kind else {
+            panic!("expected a call")
+        };
+        assert_eq!(call.name, "gain_db");
+
+        let ExpStmt::Save { probes, .. } = &experiment.body[12] else {
             panic!("expected save")
         };
         assert_eq!(probes.len(), 4);
@@ -2591,6 +2894,47 @@ end
             panic!("expected a call")
         };
         assert_eq!(second.positional.len(), 2);
+    }
+
+    /// `derive` is an experiment statement, so typing it at the session
+    /// prompt must say where it belongs rather than "unexpected".
+    #[test]
+    fn a_derive_at_the_prompt_points_at_the_experiment() {
+        let tokens = lex(SourceId(0), "derive :g, expr: v(:a)\n").expect("lexes");
+        let parsed = parse_input_detailed(&tokens);
+        assert!(parsed.diagnostics.has_errors());
+        let text = parsed.diagnostics.render_plain();
+        assert!(text.contains("body statement"), "{text}");
+        assert!(
+            text.contains("experiment :name, circuit: :name do"),
+            "{text}"
+        );
+    }
+
+    /// The frozen statement grammar: `expr:`/the reduction come first, and
+    /// `analysis:` is the only trailing argument.
+    #[test]
+    fn analysis_is_the_only_trailing_argument() {
+        expect_error(
+            "experiment :e, circuit: :x do\n  derive :g, expr: v(:a), oops: 1\nend\n",
+            "unexpected argument `oops`; `derive` takes",
+        );
+        expect_error(
+            "experiment :e, circuit: :x do\n  derive :g, expr: v(:a), analysis: ac1\nend\n",
+            "expected an analysis identity after `analysis:`",
+        );
+        expect_error(
+            "experiment :e, circuit: :x do\n  derive :g, value: 1\nend\n",
+            "unexpected argument `value`; `derive` takes",
+        );
+        expect_error(
+            "experiment :e, circuit: :x do\n  derive :g\nend\n",
+            "expected `, expr: <expression>` after `derive :name`",
+        );
+        expect_error(
+            "experiment :e, circuit: :x do\n  measure :m, max: v(:a), analysis: ac1\nend\n",
+            "expected an analysis identity after `analysis:`",
+        );
     }
 
     #[test]

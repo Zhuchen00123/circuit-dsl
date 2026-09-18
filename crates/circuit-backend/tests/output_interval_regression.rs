@@ -181,9 +181,11 @@ fn plan_for(name: &str, kind: AnalysisKind, probes: Vec<NamedProbe>) -> Analysis
             id: AnalysisId(0),
             kind,
             probes,
+            implicit_probes: Vec::new(),
             span: SourceSpan::synthetic(),
         }],
         param_overrides: Vec::new(),
+        derives: Vec::new(),
         measures: Vec::new(),
         span: SourceSpan::synthetic(),
     }

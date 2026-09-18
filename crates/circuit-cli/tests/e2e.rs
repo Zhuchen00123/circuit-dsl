@@ -637,3 +637,246 @@ fn json_output_parses() {
         .collect();
     assert!(units.contains(&"V"), "{units:?}");
 }
+
+// ---------------------------------------------------------------------------
+// result expressions: check output, analysis identity, failure path
+// ---------------------------------------------------------------------------
+
+/// Stdout with runs of whitespace collapsed, so a test can look for a
+/// statement without depending on the alignment padding `check` uses.
+fn condensed(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A text with whitespace collapsed and probe colons dropped, so a test can
+/// match an expression whether the plan carries it as written (`v(:a)`) or
+/// rendered by the plan layer (`v(a)`).
+fn normalized(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(':', "")
+}
+
+/// A file whose experiment binds two derives and a measure explicitly: a
+/// second analysis forces every expression to name its analysis, and
+/// `v(:b)` is read only because an expression needs it.
+fn expression_source(dir: &Path, name: &str) -> PathBuf {
+    let file = dir.join(name);
+    std::fs::write(
+        &file,
+        "circuit :two_node do
+  node :a, :b
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :b, value: 1.kohm
+  resistor :r2, p: :b, n: :gnd, value: 1.kohm
+end
+experiment :e, circuit: :two_node do
+  op
+  ac from: 1.Hz, to: 1.kHz, points_per_decade: 5
+  save v(:a)
+  derive :vsum, expr: v(:a)+v(:b), analysis: :op1
+  derive :gain, expr: v(:b)/v(:a), analysis: :ac1
+  measure :peak, max: abs(v(:b)/v(:a)), analysis: :ac1
+end
+",
+    )
+    .expect("write");
+    file
+}
+
+/// The trimmed line of `stdout` that starts with `prefix`.
+fn find_line<'a>(stdout: &'a str, prefix: &str) -> &'a str {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no line starting with {prefix:?} in:\n{stdout}"))
+}
+
+/// `check` must show what the experiment computes: the derives with their
+/// expression and the binding the user wrote, and the analysis reads an
+/// expression needs without presenting them as user saves.
+#[test]
+fn check_lists_derives_bindings_and_expression_reads() {
+    let dir = scratch("expr_check");
+    let file = expression_source(&dir, "expr.cdsl");
+
+    let out = run(&["check", &file.display().to_string()]);
+    assert_eq!(out.status, 0, "{}", out.stderr);
+    let text = condensed(&out.stdout);
+    assert!(text.contains("2 derive(s)"), "{text}");
+    assert!(text.contains("1 measure(s)"), "{text}");
+
+    let vsum = normalized(find_line(&out.stdout, "derive :vsum"));
+    assert!(vsum.contains("expr"), "{vsum}");
+    assert!(vsum.contains("v(a)") && vsum.contains("v(b)"), "{vsum}");
+    assert!(vsum.contains("analysis op1"), "{vsum}");
+
+    let gain = normalized(find_line(&out.stdout, "derive :gain"));
+    assert!(gain.contains("analysis ac1"), "{gain}");
+
+    // A measure keeps its reduction kind next to the expression and binding.
+    let peak = normalized(find_line(&out.stdout, "measure :peak"));
+    assert!(peak.contains("max"), "{peak}");
+    assert!(peak.contains("v(a)") && peak.contains("v(b)"), "{peak}");
+    assert!(peak.contains("analysis ac1"), "{peak}");
+
+    // An expression input is read, never exported: it must not appear in a
+    // `save` list, which is what the run will really write.
+    let reads = find_line(&out.stdout, "reads ");
+    assert!(reads.contains("v(b)"), "{reads}");
+    assert!(reads.contains("not exported"), "{reads}");
+    for line in out.stdout.lines() {
+        if line.contains("save") {
+            assert!(
+                !line.contains("v(b)"),
+                "an expression input must not be listed as a save: {line}"
+            );
+        }
+    }
+    assert!(text.contains("save v(a)"), "{text}");
+}
+
+/// The JSON dump keeps the keys it had and adds the statements: a derive is
+/// [name, expression, binding], a measure [name, kind, expression, binding].
+#[test]
+fn check_json_reports_derives_and_measure_expressions() {
+    let dir = scratch("expr_json");
+    let file = expression_source(&dir, "expr.cdsl");
+
+    let out = run(&["check", &file.display().to_string(), "--json"]);
+    assert_eq!(out.status, 0, "{}", out.stderr);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&out.stdout).expect("check --json must emit valid JSON");
+    let e = &parsed["experiments"][0];
+    assert_eq!(e["name"], "e");
+    assert_eq!(e["circuit"], "two_node");
+
+    // Unchanged: one entry per analysis, `probes` is the save list.
+    let probes = e["analyses"][0]["probes"].as_array().expect("probes array");
+    assert_eq!(probes.len(), 1, "{probes:?}");
+    assert!(probes[0].as_str().unwrap_or_default().contains("v(a)"));
+    assert_eq!(e["analyses"][0]["kind"], "op");
+    assert_eq!(e["analyses"][1]["kind"], "ac");
+
+    // An expression dependency is reported where it belongs, not as a save.
+    let implicit = e["analyses"][0]["implicit_probes"]
+        .as_array()
+        .expect("implicit_probes array");
+    assert_eq!(implicit.len(), 1, "{implicit:?}");
+    assert!(implicit[0].as_str().unwrap_or_default().contains("v(b)"));
+
+    let derives = e["derives"].as_array().expect("derives array");
+    assert_eq!(derives.len(), 2, "{derives:?}");
+    assert_eq!(derives[0][0], "vsum");
+    assert_eq!(derives[0][2], "op1");
+    assert_eq!(derives[1][0], "gain");
+    assert_eq!(derives[1][2], "ac1");
+    let expr = derives[0][1].as_str().unwrap_or_default();
+    let expr = normalized(expr);
+    assert!(expr.contains("v(a)") && expr.contains("v(b)"), "{expr}");
+
+    let measures = e["measures"].as_array().expect("measures array");
+    assert_eq!(measures.len(), 1, "{measures:?}");
+    assert_eq!(measures[0][0], "peak");
+    assert_eq!(measures[0][1], "max");
+    assert_eq!(measures[0][3], "ac1");
+    let expr = normalized(measures[0][2].as_str().unwrap_or_default());
+    assert!(expr.contains("v(b)"), "{expr}");
+}
+
+/// Every measure says which analysis it came from: `max: v(:vout)` here is a
+/// transient number, and the same name over an AC sweep would be another one.
+#[test]
+fn run_prints_the_analysis_each_measure_came_from() {
+    let dir = scratch("measure_analysis");
+    let out = run(&[
+        "run",
+        &example("rc_filter.cdsl"),
+        "--experiment",
+        "response",
+        "--out",
+        &dir.display().to_string(),
+        "--format",
+        "csv",
+    ]);
+    assert_eq!(out.status, 0, "{}", out.stderr);
+
+    // Legacy measures over a plain probe keep the documented TRAN-first rule.
+    let measures: Vec<&str> = out
+        .stdout
+        .lines()
+        .filter(|line| line.contains("measure "))
+        .collect();
+    assert_eq!(measures.len(), 3, "three measures:\n{}", out.stdout);
+    assert!(measures[0].contains("vfinal"), "{measures:?}");
+    for line in &measures {
+        assert!(
+            line.trim_end().ends_with("(tran1)"),
+            "a measure must name its analysis: {line}"
+        );
+    }
+}
+
+/// An expression that fails at run time fails the run: exit 1, a diagnostic,
+/// and no result file - not a shortened summary with a plausible exit code.
+#[test]
+fn a_failed_measure_exits_nonzero_and_writes_nothing() {
+    let dir = scratch("failed_measure");
+    let file = dir.join("bad_measure.cdsl");
+    std::fs::write(
+        &file,
+        "circuit :two_node do
+  node :a, :b
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :b, value: 1.kohm
+  resistor :r2, p: :b, n: :gnd, value: 1.kohm
+end
+experiment :e, circuit: :two_node do
+  op
+  save v(:b)
+  measure :bad, max: v(:b)/0
+end
+",
+    )
+    .expect("write");
+
+    let out_dir = dir.join("out");
+    let out = run(&[
+        "run",
+        &file.display().to_string(),
+        "--out",
+        &out_dir.display().to_string(),
+        "--format",
+        "csv",
+    ]);
+    assert_eq!(
+        out.status, 1,
+        "a failed expression is a user error:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("E_"),
+        "a diagnostic must be reported:\n{}",
+        out.stderr
+    );
+    assert!(
+        !out.stdout.contains("wrote"),
+        "no file may be announced:\n{}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("measure bad"),
+        "a failed measure must not be printed as a value:\n{}",
+        out.stdout
+    );
+    let written: Vec<_> = std::fs::read_dir(&out_dir)
+        .map(|d| d.filter_map(Result::ok).collect())
+        .unwrap_or_default();
+    assert!(
+        written.is_empty(),
+        "no partial export may exist in {}",
+        out_dir.display()
+    );
+}
