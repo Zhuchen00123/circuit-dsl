@@ -147,15 +147,30 @@ impl AcSweep {
 
 /// A transient specification.
 ///
-/// `max_step` is the maximum internal timestep, not an output interval: the
-/// solver is free to take smaller steps and the returned time axis is
-/// generally non-uniform (brief §8.4).
+/// Three concepts are deliberately kept apart here (brief §8.4); conflating
+/// them is what let a coarse output request silently rewrite a declared
+/// source waveform in an earlier revision:
+///
+/// - **`max_step`** bounds the *integration* step. It is handed to the engine
+///   as its step bound and never promises anything about the returned time
+///   axis, which stays solver-chosen and generally non-uniform.
+/// - **`output_interval`** requests *output sampling*. It is **not** a solver
+///   parameter: the run is executed with the solver's own steps and the
+///   returned trace is resampled afterwards (in `circuit-results`, which is
+///   the layer above this one). `None` keeps the solver's own grid.
+/// - The **source waveform** is whatever the circuit declares. No analysis
+///   option may widen a declared edge: the backend picks a print step that
+///   cannot clamp `rise`/`fall`/`period` (see
+///   `circuit_backend::thevenin::print_step_for`).
 #[derive(Clone, Debug)]
 pub struct TranSpec {
     pub start_s: f64,
     pub stop_s: f64,
     pub max_step: Option<f64>,
-    /// Requested output interval. `None` means "whatever the solver produced".
+    /// Requested output interval in seconds: a finite value greater than zero,
+    /// or `None` for "whatever the solver produced". Validated at the input
+    /// layer, and later used only to resample the delivered trace — never to
+    /// choose an integration step.
     pub output_interval: Option<f64>,
     /// Use initial conditions instead of a DC operating point. Not exposed by
     /// the language yet; the backend path is unverified (see

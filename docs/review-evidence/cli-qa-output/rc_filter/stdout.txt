@@ -1,0 +1,10 @@
+experiment `response` on circuit `rc_filter` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(vin), v(vout), i(input), i(r1)
+  ac1: 121 frequency points; signals: v(vin), v(vout), i(input), i(r1)
+  tran1: 1015 time points; signals: v(vin), v(vout), i(input), i(r1)
+  measure vfinal = 0.9932452475172647 V
+  measure vavg = 0.8008509267600744 V
+  measure vrms = 0.8379723543524203 V
+  wrote docs\review-evidence\cli-qa-output\rc_filter\response.op1.csv
+  wrote docs\review-evidence\cli-qa-output\rc_filter\response.ac1.csv
+  wrote docs\review-evidence\cli-qa-output\rc_filter\response.tran1.csv

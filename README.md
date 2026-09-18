@@ -2,7 +2,7 @@
 
 ## 项目简介
 
-circuit-dsl 是一门描述模拟电路的小型领域语言，配一套纯 Rust 的实现：`.cdsl` 源文件声明电路、器件、参数与实验，命令行工具 `cdsl` 负责检查源文件、执行 op / dc / ac / tran 分析、求测量值并导出 CSV / JSON 结果。`cdsl repl` 提供交互式会话：表达式即时求值、会话变量、逐条定义电路与实验并直接运行。它面向可复现的小规模模拟电路验证：电路由结构化 IR 直接交给仿真后端构造，不生成 SPICE / Cirq 源文本，展开期的错误以带源码位置的诊断给出。工作区测试实测 `cargo test --workspace` 共 **389 个测试全部通过**（0 失败），`cargo clippy --workspace --all-targets -- -D warnings` 0 条警告，`cargo fmt --all -- --check` 无差异。
+circuit-dsl 是一门描述模拟电路的小型领域语言，配一套纯 Rust 的实现：`.cdsl` 源文件声明电路、器件、参数与实验，命令行工具 `cdsl` 负责检查源文件、执行 op / dc / ac / tran 分析、求测量值并导出 CSV / JSON 结果。`cdsl repl` 提供交互式会话：表达式即时求值、会话变量、逐条定义电路与实验并直接运行。它面向可复现的小规模模拟电路验证：电路由结构化 IR 直接交给仿真后端构造，不生成 SPICE / Cirq 源文本，展开期的错误以带源码位置的诊断给出。工作区测试实测 `cargo test --workspace` 共 **456 个测试全部通过**（0 失败、24 个测试目标，本轮由 413 增至 456，新增 43 个），`cargo clippy --workspace --all-targets -- -D warnings` 0 条警告，`cargo fmt --all -- --check` 无差异。
 
 ## 快速开始
 
@@ -42,11 +42,12 @@ cargo run -p circuit-cli -- run examples/voltage_divider.cdsl --experiment divid
 #
 #     cdsl run examples/voltage_divider.cdsl --experiment divider
 #
-# must give v(out) = 2.000 V and i(r1) = +1.000 mA.
+# must give v(out) = 3.000 V and i(r1) = +2.000 mA.
 #
 # The sign is worth reading carefully: v1 sits between `in` and `gnd`, so the
-# current through it in the p -> n direction is negative (-1 mA), because it
-# delivers power. The current through r1, which absorbs it, is positive.
+# 2 mA it drives flows out of its `p` terminal into the divider, and the current
+# measured in the p -> n direction is therefore -2 mA: the source delivers
+# power. The current through r1, which absorbs it, is +2 mA.
 
 circuit :divider do
   node :in, :out
@@ -87,7 +88,9 @@ v(in),v(out),i(r1),i(v1)
 
 CSV 数值使用 SI 基本单位（V、A）；带轴的分析（dc / ac / tran）第一列是轴，OP 没有轴列。`i(v1) = -0.002 A` 为负是因为 `v1` 的 `p → n` 方向是 `in → gnd`，电压源输出功率。
 
-> 说明：该示例文件头部注释写的 `v(out) = 2.000 V`、`i(r1) = +1.000 mA` 与实际电路参数不符（5 V 加在 1 kΩ + 1.5 kΩ 上应为 3 V / 2 mA）；以上面的实测输出为准。
+> 上面引用的注释与 `examples/voltage_divider.cdsl` 当前内容逐字一致。实测复现（退出码 0）：
+> `cargo run -q -p circuit-cli -- run examples/voltage_divider.cdsl --experiment divider --out target/lead-qa/divider --format both`。
+> 示例注释承诺的 `v(out) = 3.000 V`、`i(r1) = +2.000 mA` 与实测输出一致；此处曾引用该示例注释的旧版本（写 2 V / 1 mA）并据此声称示例有误，那处说明已删除。
 
 ## CLI 用法
 
@@ -123,11 +126,11 @@ cdsl> :run response
 experiment `response` (backend thevenin 0.5.0)
   op1: scalar; signals: v(vin), v(vout), i(input), i(r1)
   ac1: 121 frequency points; signals: v(vin), v(vout), i(input), i(r1)
-  tran1: 1015 time points; signals: v(vin), v(vout), i(input), i(r1)
+  tran1: 1019 time points; signals: v(vin), v(vout), i(input), i(r1)
   ...
-  measure vfinal = 993.245 mV
-  measure vavg = 800.851 mV
-  measure vrms = 837.972 mV
+  measure vfinal = 993.262 mV
+  measure vavg = 801.347 mV
+  measure vrms = 838.266 mV
 ```
 
 几条真实发生的错误（会话里先 `:load examples/voltage_divider.cdsl`）：
@@ -172,11 +175,13 @@ source-value DC sweep: yes
 parameter DC sweep: yes (one elaboration per point, via the CLI)
 note: DC sweeps of a source value are executed natively.
 note: DC sweeps of a parameter are executed by the sweep driver in this crate, one elaboration per point.
-note: Transient output time points are solver-chosen and non-uniform; `max_step` bounds the internal step, not the output interval.
+note: Transient output time points are solver-chosen and non-uniform; `max_step` bounds the internal step, not the output interval. A declared `output_interval:` is honoured by resampling the solver's trace after the run, so it changes neither the solve nor a declared source edge.
 note: Verified on Windows MSVC only.
 ```
 
-**退出码契约**：`0` 成功；`1` 用户错误（文件读取失败、词法 / 语法 / 名称 / 量纲 / 展开错误、后端不支持的能力）；`2` 内部错误（如后端未产出任何结果）。诊断写 stderr，数据与摘要写 stdout。
+**退出码契约**：`0` 成功；`1` 用户错误（文件读取失败、词法 / 语法 / 名称 / 量纲 / 展开错误、浮空节点、后端不支持的能力）。诊断写 stderr，数据与摘要写 stdout。
+
+> 实测更正：`crates/circuit-cli/src/main.rs` 里定义了 `EXIT_INTERNAL = 2`，但**全仓库没有任何返回它的路径**（`main` 只返回 `EXIT_OK` 或 `EXIT_USER_ERROR`；7 条失败路径实测全为 1，见 `docs/review-evidence/cli-qa.md`）。因此当前版本**不会**产生退出码 2；此处曾把它写成「内部错误」，已更正。
 
 ## 已支持的功能
 
@@ -202,17 +207,20 @@ note: Verified on Windows MSVC only.
 - `op`：工作点。
 - `dc source: :dev, from:, to:, step:`：源值扫描；`dc param: :r, from:, to:, step:`：单参数扫描（由 CLI 逐点重新展开并拼接）。
 - `ac from:, to:`，配 `points_per_decade:` 或 `points:`（二选一）；相位内部以弧度存储，输入输出用度。
-- `tran start:, stop:, max_step:`（`start` 可省略，默认 0）。
+- `tran start:, stop:, max_step:, output_interval:`（`start` 可省略，默认 0；`output_interval` 可省略）。`max_step` 约束**积分步长**，`output_interval` 只控制**输出采样**：它不是求解器参数，而是求解结束后对求解器自己的时间轴做独立重采样（首点与末点保留，内部点等间隔，线性插值，不越界外推；超结果规模报 `E_LIMIT`）。因此改 `output_interval` 不会改变已声明的激励波形，也不会改变 `avg` / `rms` 等测量——测量一律用**原始求解网格**。省略 `output_interval` 时导出求解器自己的时间点。
 - 一个实验可声明多个分析，结果按分析 ID 分开导出，互不覆盖。
 
 ### 结果与导出
 
 - 探针：`save v(:n)`、`v(:a, :b)`（= Va − Vb）、`i(:dev)`（正方向 `p → n`）；测量：`measure :vmax, max: v(:out)`，归约可选 `max` / `min` / `avg` / `rms`。
-- `avg` / `rms` 在**非均匀求解器时间轴**上按时间积分，而不是样本算术平均。实测 `examples/rc_filter.cdsl`：`vavg = 0.8008509 V`、`vrms = 0.8379724 V`。
-- CSV：第一列为轴；复数列拆成 `_re` / `_im`（实测 `response.ac1.csv` 表头 `frequency,v(vin)_re,v(vin)_im,...`）；时间轴非均匀（同一实验 1015 个时间点）。
+- `avg` / `rms` 在**非均匀求解器时间轴**上按时间积分，而不是样本算术平均。实测 `examples/rc_filter.cdsl`：`vavg = 0.8013466 V`、`vrms = 0.8382662 V`（`vfinal = 0.9932621 V`）。
+- CSV：第一列为轴；复数列拆成 `_re` / `_im`（实测 `response.ac1.csv` 表头 `frequency,v(vin)_re,v(vin)_im,...`）；时间轴非均匀（同一实验 1019 个时间点，逐点由求解器决定）。
 - JSON：保留单位、轴类型与后端元数据；非有限值导出为 `null`（CSV 为空字段）并给出警告。
 - 本仓库实测数值：分压器 OP 精确给出 `v(out)=3 V`、`i(r1)=+2 mA`、`i(v1)=-2 mA`；参数扫描逐点等于 `3·1.5k/(r+1.5k)`（实测 r=500 Ω → 2.25 V、1 kΩ → 1.8 V、2 kΩ → 1.285714… V）；`examples/diode_rectifier.cdsl` 的 `op` 给出 `v(vout)=0.692872 V`，其 DC 扫描在 5 V 点给出 0.692869 V（对照 Shockley 方程二分法独立解 0.692868 V），扫描中压降只随电流对数变化（1 V 时 0.629424 V，5 V 时 0.692869 V）。
-- 后端准入用例实测（`docs/backend-evaluation.md`）：RC 瞬态对齐 `v(t)=1-e^{-t/τ}`，最差偏差 1.95e-3 V；RC 交流对齐 `H=1/(1+jωRC)`，最差偏差 5.55e-17。
+- 后端准入用例实测（`docs/backend-evaluation.md`）：RC 交流对齐 `H=1/(1+jωRC)`，最差偏差 5.55e-17。
+- RC 瞬态用**有延迟的有限斜坡**与匹配的分段解析解对照（见 `docs/backend-evaluation.md` §5）：基线配置 `tmax=τ/1000` 下 6025 个返回点**逐点**满足 TRAN 判据（`atol=1e-5 V`、`rtol=1e-3`），最大误差 **4.999167e-7 V**。两处历史结论都已被本轮证据取代：(a) 旧文档的「对齐 `1-e^{-t/τ}`，最差偏差 1.95e-3 V」是**参考模型错**——当时的适配层把 `.tran` 的 step 取成输出间隔，使引擎把声明的 1 ps 上升沿夹紧到 500 ns，用理想阶跃当参考必然得到 `C·e^{-t/τ}`（`C≈-2.504e-3 V`）的残差；(b) 适配层现在按声明边沿选 step，声明值会被兑现（`rise=10.ns`、`output_interval` 1 ns→100 ns 时原始求解网格逐位相同，约 50 ns 处 `v(vin)=1 V`）。
+- **输出间隔不改变物理解**（本轮回归）：同一电路 `rise=fall=10.ns`、`max_step=1.ns`、`stop=2.us`，`output_interval` 取 1 ns 与 100 ns 时原始求解时间轴与全部样本**逐位相同**；`output_interval` 只改变输出网格（100 ns → 21 点、首末点等于原始首末点）与 `avg` / `rms` / `max` / `min` **无关**。修复前同一对照在约 50 ns 处给出 `v(vin)=0.5002375 V`（`docs/review-evidence/round2/repro-baseline.md`），修复后为 `1 V`。
+- `examples/rc_filter.cdsl` 的 `tran`（`stop: 500.us, max_step: 500.ns`，未给 `output_interval`）实测 1019 个输出点，末点 `t=500 us` 时 `v(vout)=0.9932620899316276 V`，与 `1-exp(-t/τ)` 的 `0.993262053000915 V` 相差 **3.7e-8 V**——声明 `rise: 1.ns` 现在被真正兑现（修复前该文件是 500 ns 斜坡，同一点误差约 2.5e-3 V）。
 
 ## 已知限制
 
@@ -220,8 +228,12 @@ note: Verified on Windows MSVC only.
 - **电流探针只覆盖部分器件**：电压源与电感的支路电流由引擎直接给出；电阻的电流按欧姆定律推导，并用引擎给出的源电流交叉验证；电容、二极管、独立电流源的电流**明确拒绝**（报 `E_UNSUPPORTED`），不做近似。
 - **参数扫描只支持单个参数**（`dc param:`），不支持多参数联合扫描。
 - **参数只能引用其之前声明的参数**（顺序敏感），因此参数依赖不可能是环；扫描参数时每个点会检查拓扑不变，拓扑参数不允许扫描。
-- **`max_step` 约束的是求解器内部步长，不是输出间隔**：返回的时间轴由求解器决定且通常非均匀。
-- 悬空节点（无直流参考通路）由**前端**检查，不由后端报告：引擎的 gmin 处理会让这类节点取到看似正常的有限值并照常返回结果（实测见 `docs/backend-evaluation.md` §4.6），因此 `circuit-core::connectivity` 在展开结束时做直流参考通路可达性检查——判据是能否经**直流导通**器件到达地，电容与独立电流源不算——命中时报 `E_NAME`。同一个 body 内没有任何器件连接的节点也会被报出。
+- **`max_step` 约束的是求解器内部步长，不是输出间隔**：返回的时间轴由求解器决定且通常非均匀。要固定输出间隔请用 `tran output_interval:`——它在求解后重采样，不参与求解。
+- 悬空节点（无直流参考通路）由**前端**检查：引擎对**真无参考**的线性网络会以 `matrix is singular, cannot solve` 失败，但该错误不指向任何节点，也无法区分「合法开路输出」与「真正无参考」（实测见 `docs/review-evidence/floating-audit.md`；旧文档把它写成「gmin 把节点拉住并返回 Ok」，已废弃）。因此 `circuit-core::connectivity` 在展开结束时做直流参考通路可达性检查——判据是能否经**直流导通**器件到达地，电容与独立电流源不算——命中时报 `E_NAME`。同一个 body 内没有任何器件连接的节点也会被报出。
+- **PULSE 的 `rise` / `fall` / `period` 不会被分析选项展宽**：引擎把 PULSE 的上升/下降时间夹紧到 `.tran` 的 print step（`tr.unwrap_or(tstep).max(tstep)`），而适配层现在把该 step 选为 `min(span/1000, 电路中声明的最小 rise/fall/period)`，且**完全不受 `output_interval` 影响**，所以已声明的边沿会按声明值执行（`examples/rc_filter.cdsl` 的 `rise: 1.ns` 不再是 500 ns 斜坡）。若声明的边沿是 0 或非有限（引擎没有理想零宽边沿），或在给定窗口内执行需要超过 1e6 个求解步，`cdsl check` / `cdsl run` 会给出明确的能力诊断（`E_UNSUPPORTED` / `E_LIMIT`）而不是静默展宽。实测与源码依据见 `docs/review-evidence/round2/`。
+- **运行中的源断点附近精度受求解器重启步限制**：引擎在源波形断点（PULSE 的 delay、上升结束、下降开始、周期边界等）之后的第一个接受步强制 Backward-Euler，并把步长缩到 `step_h.min(h*0.1)`；由此产生的局部误差约为 `(V0/T)·h1²/(2τ)`（`T` 为声明边沿宽度、`τ` 为电路时间常数、`h1` 为该重启步）。τ=100 µs、T=1 µs 的 RC 实测：`max_step=τ/1000` → 0/3129 点超 §17（最大误差 4.999167e-7 V）、`τ/500` → 0/1629、`τ/200` → 3/729 超限（最大 1.248959e-5 V）、`τ/50` → 250/309 超限（最大 7.331775e-4 V）。超限配置原样保留为限制，不删除样本、不放宽阈值；上述界只针对该激励推导，不构成任意电路的精度保证。详见 `docs/review-evidence/round2/breakpoint-evidence.md`。
+- **求解器容差没有产品通道**：适配层 `build_circuit` 把 Thevenin 的 `options` 传成空，因此 `RELTOL` / `ABSTOL` / `VNTOL` / `GMIN` 恒为引擎默认（`reltol = 1e-3`、`abstol = 1e-12`），DSL 也没有对应语法。容差只影响 `max_step` 未钉住步长时的 LTE 步长控制；本轮在 `_probe`（直接构造 `cirq_ir::Circuit`）里做过受控实验：`RELTOL` / `ABSTOL` / `TRTOL` 单因子不可观测，`RELTOL+ABSTOL` 交互会改变轨迹但**不改变断点重启步与 §17 结论**。适配层新增容差通道属于后续工作。
+- **`--out` 指向一个已存在的普通文件时**：报的是「无法创建目录」而不是 `guard_output` 的防覆盖诊断，退出码仍为 1，输入源文件不会被改写（`docs/review-evidence/cli-qa.md` 的 F6）。
 - 首期只对外开放 R / L / C / 独立电压源 / 独立电流源 / 二极管，其余器件即便后端声明支持也未在本项目验证。
 
 ## 尚未实现 / 未验证

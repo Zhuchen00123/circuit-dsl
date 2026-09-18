@@ -1,0 +1,7 @@
+﻿cargo :     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.21s
+At line:1 char:266
++ ... TEXITCODE"; cargo clippy --workspace --all-targets -- -D warnings 2>& ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `d...get(s) in 0.21s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

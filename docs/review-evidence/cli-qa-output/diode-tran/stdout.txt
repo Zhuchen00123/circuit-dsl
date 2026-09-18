@@ -1,0 +1,5 @@
+experiment `rectified` on circuit `half_wave` (backend thevenin 0.5.0)
+  tran1: 1008 time points; signals: v(vin), v(vout)
+  measure vpeak = 4.3071284013527 V
+  measure vavg = 1.2684005202349173 V
+  wrote docs\review-evidence\cli-qa-output\diode-tran\rectified.tran1.csv

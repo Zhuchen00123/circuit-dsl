@@ -1,0 +1,2 @@
+error[E_ARGUMENT]: `examples\diode_rectifier.cdsl` defines 2 experiments; choose one with --experiment
+   = experiments: rectified, forward_drop

@@ -1,0 +1,588 @@
+﻿cargo : warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\circuit_backend-71b97ad6541a6889.lib 和对象 F:\codexprojects\ds
+l000\target\debug\deps\circuit_backend-71b97ad6541a6889.exp
+At line:1 char:129
++ ... .Text.UTF8Encoding]::new($false); cargo test --workspace 2>&1 | Out-F ...
++                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: linker...ad6541a6889.exp:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `circuit-backend` (lib test) generated 1 warning
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\phase_regression-29c43d48f22580d9.lib 和对象 F:\codexprojects\dsl000\ta
+rget\debug\deps\phase_regression-29c43d48f22580d9.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\adapter-418ce953c6bf6b18.lib 和对象 F:\codexprojects\dsl000\target\debu
+g\deps\adapter-418ce953c6bf6b18.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\transient_reference_regression-bf76bb2f1be02b11.lib 和对象 F:\codexproj
+ects\dsl000\target\debug\deps\transient_reference_regression-bf76bb2f1be02b11.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\circuit_session-b9f3cde3130a68f4.lib 和对象 F:\codexprojects\dsl000\tar
+get\debug\deps\circuit_session-b9f3cde3130a68f4.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `circuit-backend` (test "phase_regression") generated 1 warning
+warning: `circuit-backend` (test "adapter") generated 1 warning
+warning: `circuit-backend` (test "transient_reference_regression") generated 1 warning
+warning: `circuit-session` (lib test) generated 1 warning
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\session-fd47a37915fd2827.lib 和对象 F:\codexprojects\dsl000\target\debu
+g\deps\session-fd47a37915fd2827.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `circuit-session` (test "session") generated 1 warning
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\cdsl.lib 和对象 F:\codexprojects\dsl000\target\debug\deps\cdsl.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\debug\deps\cdsl-eb7de1acc724b603.lib 和对象 F:\codexprojects\dsl000\target\debug\d
+eps\cdsl-eb7de1acc724b603.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `circuit-cli` (bin "cdsl") generated 1 warning
+warning: `circuit-cli` (bin "cdsl" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src\lib.rs (target\debug\deps\circuit_backend-71b97ad6541a6889.exe)
+
+running 15 tests
+test backend::tests::capabilities_answer_queries ... ok
+test backend::tests::unknown_failures_keep_their_text ... ok
+test backend::tests::convergence_is_recognised ... ok
+test sweep::tests::changing_a_device_kind_is_a_topology_change ... ok
+test sweep::tests::a_backwards_step_is_rejected ... ok
+test sweep::tests::a_missing_step_is_rejected_with_advice ... ok
+test sweep::tests::a_zero_step_is_rejected ... ok
+test backend::tests::singular_is_recognised ... ok
+test sweep::tests::changing_only_a_value_keeps_the_topology ... ok
+test sweep::tests::coordinates_include_both_ends_when_aligned ... ok
+test backend::tests::unsupported_is_recognised ... ok
+test sweep::tests::descending_sweeps_work ... ok
+test sweep::tests::coordinates_stop_before_an_unaligned_end ... ok
+test sweep::tests::rewiring_is_a_topology_change ... ok
+test sweep::tests::adding_a_device_is_a_topology_change ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\adapter.rs (target\debug\deps\adapter-418ce953c6bf6b18.exe)
+
+running 21 tests
+test capabilities_are_declared_honestly ... ok
+test a_bad_probe_is_reported_once_not_once_per_analysis ... ok
+test a_parameter_sweep_is_refused_by_the_single_point_executor ... ok
+test capacitor_current_is_refused_with_a_reason ... ok
+test a_singular_circuit_is_reported_not_swallowed ... ok
+test dc_source_sweep_is_linear_through_a_divider ... ok
+test backend_metadata_is_recorded ... ok
+test diode_op_matches_independent_solution ... ok
+test only_requested_probes_are_returned ... ok
+test divider_op_and_current_direction ... ok
+test resistor_current_is_derivable_with_a_grounded_terminal ... ok
+test signals_carry_their_units ... ok
+test grounded_resistor_current_is_derivable_in_ac ... ok
+test ac_phase_is_converted_from_radians_to_degrees ... ok
+test derived_resistor_current_agrees_with_source_current_in_ac ... ok
+test differential_probe_subtracts_complex_signals ... ok
+test zero_resistance_does_not_produce_an_infinite_current ... ok
+test rc_ac_matches_analytic ... ok
+test rlc_ac_matches_analytic ... ok
+test two_analyses_of_the_same_kind_get_distinct_names ... ok
+test rc_transient_matches_analytic ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\phase_regression.rs (target\debug\deps\phase_regression-29c43d48f22580d9.exe)
+
+running 6 tests
+test convention_guards_separate_sign_axis_and_degree_errors ... ok
+test ac_phase_is_converted_from_radians_to_degrees ... ok
+test rc_lowpass_with_nonzero_source_phase_matches_analytic ... ok
+test ac_phase_sign_convention_across_angles ... ok
+test sin_waveform_phase_is_degrees_not_radians ... ok
+test sin_waveform_with_nonzero_phase_matches_engine_formula ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests\transient_reference_regression.rs (target\debug\deps\transient_reference_regression-bf76bb2f1be02b11.exe)
+
+running 4 tests
+test reference_solution_matches_independent_checks ... ok
+test declared_rise_below_output_interval_is_clamped_to_the_output_step ... ok
+test rc_finite_ramp_matches_reference_on_every_point ... ok
+test max_step_reaches_the_engine_and_every_setting_meets_the_criteria ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.19s
+
+     Running unittests src\main.rs (target\debug\deps\cdsl-eb7de1acc724b603.exe)
+
+running 9 tests
+test repl::tests::the_history_path_is_in_the_home_directory ... ok
+test repl::tests::leaving_by_eof_is_not_a_failure ... ok
+test repl::tests::an_interrupt_drops_the_input_and_keeps_the_session ... ok
+test tests::format_selects_channels ... ok
+test repl::tests::the_prompt_follows_what_the_session_is_waiting_for ... ok
+test repl::tests::completion_covers_commands_definitions_and_variables ... ok
+test tests::cli_definition_is_valid ... ok
+test tests::guard_rejects_writing_over_the_input ... ok
+test repl::tests::history_round_trips_through_a_file ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\e2e.rs (target\debug\deps\e2e-da7f59dfe2485ab6.exe)
+
+running 18 tests
+test a_missing_file_is_a_user_error ... ok
+test capabilities_reports_the_backend ... ok
+test check_json_describes_the_circuit ... ok
+test check_accepts_an_ac_coupled_stage_with_a_bias_resistor ... ok
+test check_rejects_a_node_with_no_dc_path_to_ground ... ok
+test run_divider_produces_the_correct_voltages_and_currents ... ok
+test run_diode_sweep_shows_a_logarithmic_forward_drop ... ok
+test run_parameter_sweep_is_exact ... ok
+test check_reports_a_dimension_error_with_a_location ... ok
+test run_ladder_matches_the_analytic_taps ... ok
+test json_output_parses ... ok
+test running_an_unknown_experiment_lists_the_real_ones ... ok
+test run_two_stage_exercises_the_composition_features ... ok
+test check_reports_a_node_nothing_connects_to ... ok
+test version_works ... ok
+test the_default_experiment_is_used_when_only_one_exists ... ok
+test run_rc_filter_matches_the_analytic_response ... ok
+test check_accepts_every_example ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.17s
+
+     Running tests\repl.rs (target\debug\deps\repl-09c7c941c1d8c48d.exe)
+
+running 11 tests
+test a_failed_definition_leaves_the_previous_one_running ... ok
+test an_unknown_command_is_reported_and_a_symbol_is_not_one ... ok
+test a_session_evaluates_expressions_and_keeps_variables ... ok
+test a_syntax_error_is_reported_and_the_session_continues ... ok
+test a_session_defines_runs_changes_a_parameter_and_runs_again ... ok
+test a_variable_never_reaches_a_circuit ... ok
+test a_session_can_load_an_example_file_and_run_it ... ok
+test loading_a_file_twice_reports_the_clash_unless_told_to_replace ... ok
+test multi_line_input_shows_a_continuation_prompt ... ok
+test quitting_and_end_of_input_both_exit_cleanly ... ok
+test a_run_can_write_its_results ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running unittests src\lib.rs (target\debug\deps\circuit_core-00a119c03980d63d.exe)
+
+running 58 tests
+test connectivity::tests::a_coupled_node_with_a_bias_resistor_is_fine ... ok
+test connectivity::tests::a_capacitor_does_not_provide_a_dc_path ... ok
+test connectivity::tests::ground_itself_is_never_reported ... ok
+test format::tests::capacitance_and_voltage_prefixes ... ok
+test connectivity::tests::a_diode_anchors_a_node ... ok
+test connectivity::tests::a_resistive_divider_has_no_floating_nodes ... ok
+test connectivity::tests::an_inductor_provides_a_dc_path ... ok
+test connectivity::tests::conductive_devices_are_classified ... ok
+test diagnostic::tests::diagnostics_aggregate ... ok
+test diagnostic::tests::renders_location_and_caret ... ok
+test diagnostic::tests::synthetic_span_does_not_become_a_location ... ok
+test connectivity::tests::a_declared_but_unused_node_is_reported_separately ... ok
+test format::tests::compound_dimensions_do_not_claim_a_unit ... ok
+test format::tests::dimensionless_and_compound_dimensions_have_no_prefix ... ok
+test format::tests::formatted_quantities_use_spellable_units ... ok
+test connectivity::tests::a_current_source_does_not_anchor_a_node ... ok
+test format::tests::non_finite_values_are_left_to_the_caller ... ok
+test format::tests::plain_numbers_are_not_reformatted ... ok
+test format::tests::quantities_round_to_six_significant_digits ... ok
+test format::tests::quantities_use_an_engineering_prefix ... ok
+test format::tests::short_but_extreme_numbers_use_exponent_notation ... ok
+test format::tests::values_outside_the_prefix_table_use_exponent_notation ... ok
+test format::tests::zero_keeps_its_unit ... ok
+test id::tests::ids_are_type_distinct_and_ordered ... ok
+test ir::tests::devices_on_node_are_found ... ok
+test ir::tests::hierarchical_name_and_instance_display ... ok
+test ir::tests::lookups_work_by_id_and_name ... ok
+test ir::tests::rejects_dangling_terminals ... ok
+test ir::tests::rejects_duplicate_names ... ok
+test ir::tests::rejects_sparse_node_indexing ... ok
+test ir::tests::source_spec_reports_emptiness ... ok
+test ir::tests::terminal_direction_is_fixed ... ok
+test ir::tests::value_dimensions_are_declared ... ok
+test limits::tests::defaults_are_generous_but_finite ... ok
+test limits::tests::test_limits_are_stricter ... ok
+test plan::tests::decade_point_count_matches_ngspice_convention ... ok
+test plan::tests::degenerate_ranges_report_zero ... ok
+test plan::tests::differential_probe_touches_both_nodes ... ok
+test plan::tests::linear_point_count_is_total_points ... ok
+test span::tests::excerpt_renders_line_and_carets ... ok
+test span::tests::line_col_counts_chars_not_bytes ... ok
+test span::tests::line_col_is_one_based ... ok
+test span::tests::merge_across_files_keeps_left ... ok
+test span::tests::merge_takes_union_within_one_file ... ok
+test span::tests::synthetic_spans_are_flagged ... ok
+test units::tests::addition_requires_matching_dimensions ... ok
+test units::tests::arithmetic_derives_dimensions ... ok
+test units::tests::base_units_resolve ... ok
+test units::tests::dimensionless_is_required_explicitly ... ok
+test units::tests::longest_suffix_stops_before_punctuation ... ok
+test units::tests::display_prefixes_round_trip_through_the_parser ... ok
+test units::tests::m_is_milli_and_m_is_mega ... ok
+test units::tests::ohm_spellings_agree ... ok
+test units::tests::pow_scales_exponents ... ok
+test units::tests::prefixes_scale_correctly ... ok
+test units::tests::quantity_literals_build ... ok
+test units::tests::unit_parse_errors_are_specific ... ok
+test units::tests::unknown_suffixes_are_rejected ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\circuit_dsl-511a7852ca55ae39.exe)
+
+running 84 tests
+test ast::tests::expressions_carry_spans ... ok
+test ast::tests::binary_op_classification ... ok
+test ast::tests::analysis_call_finds_named_args ... ok
+test ast::tests::call_lookup_uses_named_args ... ok
+test ast::tests::program_lookup_by_name ... ok
+test complete::tests::a_finished_input_is_complete ... ok
+test ast::tests::stmt_keywords_come_from_device_kind ... ok
+test complete::tests::a_body_statement_is_invalid_with_a_pointer_to_its_home ... ok
+test complete::tests::a_closed_input_that_is_wrong_is_invalid ... ok
+test complete::tests::a_do_inside_a_string_or_comment_is_not_a_block ... ok
+test ast::tests::expr_helpers_round_trip ... ok
+test complete::tests::a_trailing_operator_continues ... ok
+test complete::tests::an_unclosed_block_continues ... ok
+test complete::tests::a_multi_line_continuation_completes ... ok
+test complete::tests::an_unclosed_bracket_continues ... ok
+test complete::tests::empty_input_is_complete ... ok
+test complete::tests::incomplete_reports_where_it_opened ... ok
+test complete::tests::lexer_errors_are_final_not_continuations ... ok
+test complete::tests::the_trailing_token_list_covers_the_continuation_set ... ok
+test lexer::tests::a_plain_hash_inside_a_string_is_still_allowed ... ok
+test lexer::tests::assignment_does_not_swallow_the_comparison_operators ... ok
+test lexer::tests::carriage_returns_are_whitespace ... ok
+test lexer::tests::comments_run_to_the_end_of_the_line ... ok
+test lexer::tests::eof_is_always_last_and_sits_at_the_end_of_input ... ok
+test lexer::tests::exclusive_range_is_refused_rather_than_misread ... ok
+test lexer::tests::illegal_characters_are_reported_at_their_own_span ... ok
+test lexer::tests::integers_floats_and_scientific_notation ... ok
+test lexer::tests::lexing_continues_after_a_bad_unit_and_an_illegal_character ... ok
+test lexer::tests::lone_assignment_operators_are_rejected ... ok
+test lexer::tests::micro_spellings_agree ... ok
+test lexer::tests::milli_and_mega_differ_by_case ... ok
+test lexer::tests::newlines_are_suppressed_after_continuation_points ... ok
+test lexer::tests::newlines_are_suppressed_inside_brackets ... ok
+test lexer::tests::newlines_end_statements_and_blank_runs_collapse ... ok
+test lexer::tests::operators_use_longest_match ... ok
+test lexer::tests::quantity_literals_carry_value_dimension_and_text ... ok
+test lexer::tests::quantity_stops_before_punctuation_and_identifiers ... ok
+test lexer::tests::range_lexes_as_dot_dot ... ok
+test lexer::tests::spans_cover_the_token_text ... ok
+test lexer::tests::strings_have_no_escapes_and_differ_from_symbols ... ok
+test lexer::tests::string_interpolation_is_refused_rather_than_taken_literally ... ok
+test lexer::tests::symbols_and_colons_are_distinguished ... ok
+test lexer::tests::unknown_unit_suffix_is_reported_at_the_suffix ... ok
+test lexer::tests::unterminated_string_is_reported_to_the_end_of_the_line ... ok
+test parser::tests::a_bare_identifier_is_a_variable_not_a_call ... ok
+test parser::tests::a_dot_that_is_not_a_path_is_still_left_alone ... ok
+test parser::tests::a_dotted_symbol_is_one_name_covering_the_whole_path ... ok
+test parser::tests::a_positional_expression_where_a_label_belongs_is_rejected ... ok
+test parser::tests::all_parse_errors_are_syntax_errors ... ok
+test parser::tests::an_empty_token_stream_is_an_empty_program ... ok
+test parser::tests::assignment_in_a_file_points_at_param ... ok
+test parser::tests::assignment_targets_must_be_plain_names ... ok
+test parser::tests::calls_take_positional_then_named_arguments ... ok
+test parser::tests::atoms_cover_literals_symbols_arrays_dicts_and_calls ... ok
+test parser::tests::every_device_keyword_from_the_spec_parses ... ok
+test parser::tests::every_expression_carries_a_span_covering_its_text ... ok
+test parser::tests::if_condition_can_use_operators ... ok
+test parser::tests::for_over_a_range_and_over_a_list ... ok
+test parser::tests::if_elsif_else_arms_are_collected_in_order ... ok
+test parser::tests::experiment_statements_cover_every_documented_form ... ok
+test parser::tests::interactive_inputs_are_expressions_assignments_or_definitions ... ok
+test parser::tests::interactive_mistakes_name_their_fix ... ok
+test parser::tests::missing_colon_reports_the_expected_label_syntax ... ok
+test parser::tests::malformed_headers_are_reported_once_and_recovered ... ok
+test parser::tests::missing_end_names_the_construct_and_points_at_its_header ... ok
+test parser::tests::multi_line_argument_lists_and_trailing_commas_are_accepted ... ok
+test parser::tests::multiplication_binds_tighter_than_addition ... ok
+test parser::tests::nested_blocks_belong_to_their_own_statement ... ok
+test parser::tests::operators_are_left_associative_and_ordered_by_level ... ok
+test parser::tests::parenthesised_expressions_keep_the_inner_kind_but_widen_the_span ... ok
+test parser::tests::positional_argument_after_a_named_one_is_rejected ... ok
+test parser::tests::save_probe_expressions_keep_their_spans ... ok
+test parser::tests::several_independent_errors_are_reported_in_one_run ... ok
+test parser::tests::rc_filter_example_parses_into_the_expected_shape ... ok
+test parser::tests::string_and_symbol_literals_are_different_expressions ... ok
+test parser::tests::unclosed_expressions_are_reported ... ok
+test parser::tests::two_stage_example_parses_subcircuits_and_instances ... ok
+test parser::tests::unary_operators_nest_and_bind_tighter_than_multiplication ... ok
+test token::tests::continuation_points_cover_the_documented_cases ... ok
+test parser::tests::unexpected_tokens_are_reported_with_their_text ... ok
+test token::tests::only_idents_start_statements ... ok
+test token::tests::reserved_words_are_reported ... ok
+test token::tests::describes_tokens_for_diagnostics ... ok
+test parser::tests::truncated_input_terminates ... ok
+
+test result: ok. 84 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests\elaborate.rs (target\debug\deps\elaborate-0477c211e88d4931.exe)
+
+running 67 tests
+test a_diode_requires_a_declared_model ... ok
+test a_computed_terminal_naming_an_undeclared_node_is_reported_as_such ... ok
+test a_computed_terminal_cannot_smuggle_in_a_dotted_or_empty_name ... ok
+test a_loop_can_build_a_ladder_from_computed_node_names ... ok
+test a_circuit_cannot_be_instantiated_as_a_subcircuit ... ok
+test a_dc_sweep_needs_a_step_or_points ... ok
+test a_dc_source_sweep_resolves_the_device ... ok
+test a_computed_name_must_be_a_legal_identifier ... ok
+test a_dc_sweep_of_a_non_source_is_reported ... ok
+test a_forward_parameter_reference_is_rejected ... ok
+test a_computed_terminal_must_evaluate_to_a_name ... ok
+test a_hierarchy_path_that_matches_nothing_is_reported ... ok
+test a_hierarchy_path_reaches_inside_an_instance ... ok
+test a_hierarchy_path_may_be_written_as_a_string ... ok
+test a_duplicate_device_names_both_locations ... ok
+test a_diode_with_a_model_elaborates ... ok
+test a_loop_expands_into_distinct_devices ... ok
+test a_loop_variable_can_name_devices_distinctly ... ok
+test a_loop_over_a_list_repeats_the_body ... ok
+test a_missing_port_binding_is_reported ... ok
+test a_loop_variable_may_reuse_a_name_from_the_enclosing_body ... ok
+test a_missing_required_argument_is_reported ... ok
+test a_loop_variable_does_not_escape_its_loop ... ok
+test a_non_boolean_condition_is_reported ... ok
+test a_parameter_cannot_be_declared_inside_a_block ... ok
+test a_probe_on_an_unknown_device_is_reported ... ok
+test a_probe_on_an_unknown_node_is_reported_with_the_available_ones ... ok
+test a_self_referential_parameter_is_rejected ... ok
+test a_pulse_that_cannot_fit_its_period_is_reported ... ok
+test a_terminal_that_is_a_bare_word_is_told_to_write_a_colon ... ok
+test a_wrong_dimension_is_reported_with_both_dimensions ... ok
+test ac_needs_a_positive_increasing_range ... ok
+test an_experiment_must_name_a_real_circuit ... ok
+test an_experiment_without_an_analysis_is_reported ... ok
+test ac_rejects_two_point_specifications ... ok
+test ac_rejects_a_frequency_written_with_the_wrong_unit ... ok
+test an_override_with_the_wrong_dimension_is_reported ... ok
+test an_experiment_override_must_name_a_declared_parameter ... ok
+test an_override_must_name_a_declared_parameter ... ok
+test an_unambiguous_leaf_name_still_resolves ... ok
+test an_undeclared_node_is_an_error_not_a_new_node ... ok
+test an_ambiguous_leaf_name_is_refused_and_lists_the_paths ... ok
+test an_undeclared_parameter_is_an_error ... ok
+test an_unknown_experiment_name_is_reported ... ok
+test an_unknown_argument_lists_what_is_accepted ... ok
+test an_unknown_function_is_reported ... ok
+test an_unknown_port_binding_is_reported ... ok
+test comparing_different_dimensions_is_reported ... ok
+test an_unknown_measurement_kind_is_reported ... ok
+test differential_probe_is_typed_as_such ... ok
+test an_unknown_parameter_override_is_reported ... ok
+test conditional_expansion_follows_the_taken_branch ... ok
+test duplicate_names_from_a_loop_are_reported ... ok
+test dimensionless_contexts_reject_quantities ... ok
+test measurements_resolve_their_target ... ok
+test name_concatenation_converts_only_what_is_unambiguous ... ok
+test non_positive_passives_are_rejected_rather_than_clamped ... ok
+test subcircuit_instances_are_isolated_and_parameters_override ... ok
+test rc_filter_example_elaborates ... ok
+test re_elaborating_with_an_override_changes_the_value_not_the_topology ... ok
+test saving_the_same_probe_twice_is_reported ... ok
+test the_loop_limit_is_enforced ... ok
+test tran_validates_its_window ... ok
+test recursion_is_reported_with_the_call_chain ... ok
+test parameters_are_resolved_in_declaration_order ... ok
+test voltage_divider_elaborates ... ok
+test the_device_limit_is_enforced ... ok
+
+test result: ok. 67 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests\phase_syntax_regression.rs (target\debug\deps\phase_syntax_regression-b2ecbcade46e47bc.exe)
+
+running 6 tests
+test sin_phase_must_be_dimensionless ... ok
+test sin_phase_is_converted_from_degrees_to_radians ... ok
+test sin_without_a_phase_defaults_to_zero_radians ... ok
+test an_ac_source_has_no_phase_argument_yet ... ok
+test ir_phase_is_radians_so_the_adapter_can_convert_back_to_degrees ... ok
+test sin_phase_covers_zero_both_signs_and_a_half_turn ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\reference_path_regression.rs (target\debug\deps\reference_path_regression-f0231826ebf3faae.exe)
+
+running 8 tests
+test a_legal_open_output_is_accepted ... ok
+test a_diode_is_a_dc_reference_path ... ok
+test an_isolated_resistor_network_is_rejected ... ok
+test a_node_coupled_only_through_a_capacitor_is_rejected ... ok
+test the_same_devices_with_the_capacitor_to_ground_are_accepted ... ok
+test a_declared_but_unconnected_node_is_reported_separately ... ok
+test an_inductor_is_a_dc_reference_path ... ok
+test a_current_source_alone_does_not_reference_a_node ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\circuit_results-e70fabf009673e06.exe)
+
+running 71 tests
+test dataset::tests::axis_reports_kind_and_unit ... ok
+test dataset::tests::complex_samples_count_twice_towards_the_limit ... ok
+test dataset::tests::diagnostics_can_be_attached_to_a_result ... ok
+test dataset::tests::duplicate_signal_names_are_rejected_case_insensitively ... ok
+test dataset::tests::sample_count_distinguishes_op_from_empty_sweep ... ok
+test dataset::tests::signal_lookup_ignores_case_and_whitespace ... ok
+test dataset::tests::non_finite_detection_covers_axis_and_signals ... ok
+test dataset::tests::operating_point_requires_exactly_one_sample ... ok
+test export::tests::clean_datasets_produce_no_warnings ... ok
+test dataset::tests::data_reports_shape_and_finiteness ... ok
+test dataset::tests::signal_length_must_match_the_axis ... ok
+test dataset::tests::complex_magnitude_and_phase ... ok
+test dataset::tests::validation_accepts_a_well_formed_dataset ... ok
+test dataset::tests::complex_arithmetic_is_complex ... ok
+test export::tests::csv_has_one_column_per_axis_and_signal ... ok
+test export::tests::complex_division_by_zero_is_not_hidden ... ok
+test export::tests::csv_keeps_extreme_magnitudes_parseable ... ok
+test export::tests::csv_of_an_empty_sweep_is_just_the_header ... ok
+test dataset::tests::oversized_results_are_rejected_without_truncation ... ok
+test export::tests::csv_of_an_operating_point_has_no_axis_column ... ok
+test export::tests::csv_quotes_probe_names_that_contain_commas ... ok
+test export::tests::csv_writes_non_finite_values_as_empty_fields ... ok
+test export::tests::json_of_an_operating_point_has_no_axis_values ... ok
+test export::tests::json_is_valid_even_when_every_sample_is_non_finite ... ok
+test export::tests::json_preserves_metadata_units_and_axis ... ok
+test export::tests::json_reports_result_diagnostics ... ok
+test export::tests::parameter_axis_has_no_unit_but_keeps_its_values ... ok
+test export::tests::json_serialises_nan_and_infinity_as_null_and_round_trips ... ok
+test expr::tests::abs_of_a_complex_signal_is_the_magnitude ... ok
+test expr::tests::abs_of_a_real_signal_keeps_the_unit ... ok
+test expr::tests::differential_prefers_a_saved_differential_signal ... ok
+test expr::tests::differential_promotes_mixed_real_and_complex ... ok
+test expr::tests::differential_subtracts_two_complex_signals ... ok
+test expr::tests::differential_subtracts_two_real_signals ... ok
+test expr::tests::gain_db_of_a_complex_ratio_uses_the_magnitude ... ok
+test expr::tests::gain_db_of_a_known_ratio ... ok
+test expr::tests::gain_db_requires_a_dimensionless_ratio ... ok
+test expr::tests::min_and_max_reject_complex_data ... ok
+test expr::tests::min_and_max_work_element_wise_on_real_vectors ... ok
+test expr::tests::min_broadcasts_a_scalar_literal ... ok
+test expr::tests::mismatched_vector_lengths_are_reported ... ok
+test expr::tests::missing_signal_is_a_name_error_listing_alternatives ... ok
+test expr::tests::missing_signal_note_says_none_when_there_are_no_signals ... ok
+test expr::tests::multiplication_derives_dimensions ... ok
+test expr::tests::negation_flips_real_and_complex_samples ... ok
+test expr::tests::signal_lookup_is_case_insensitive ... ok
+test expr::tests::sqrt_halves_even_dimension_exponents ... ok
+test expr::tests::sqrt_of_an_odd_dimension_is_rejected ... ok
+test expr::tests::sqrt_of_complex_data_is_rejected_as_a_type_error ... ok
+test expr::tests::subtracting_different_units_is_a_dimension_error ... ok
+test expr::tests::voltage_helper_builds_the_probe_name ... ok
+test measure::tests::a_single_time_point_cannot_be_integrated ... ok
+test measure::tests::avg_and_rms_of_a_constant_are_that_constant ... ok
+test measure::tests::avg_is_a_time_integral_not_a_sample_mean ... ok
+test measure::tests::avg_on_an_operating_point_is_a_type_error ... ok
+test measure::tests::complex_measurements_use_the_magnitude ... ok
+test measure::tests::complex_rms_uses_the_magnitude_over_a_time_axis ... ok
+test measure::tests::degenerate_time_axis_does_not_divide_by_zero ... ok
+test measure::tests::max_and_min_are_sample_extremes ... ok
+test measure::tests::measure_can_reduce_an_expression_over_two_signals ... ok
+test measure::tests::measurement_keywords_round_trip ... ok
+test measure::tests::measure_evaluates_an_expression_then_reduces_it ... ok
+test measure::tests::nan_samples_make_the_extreme_nan_rather_than_being_skipped ... ok
+test measure::tests::reduce_reports_an_empty_signal ... ok
+test measure::tests::rms_is_a_time_integral_not_a_sample_rms ... ok
+test measure::tests::rms_on_a_dc_sweep_is_a_type_error ... ok
+test measure::tests::trapezoid_handles_two_unequal_segments ... ok
+test tests::non_finite_values_are_left_to_the_caller ... ok
+test tests::plain_numbers_are_not_reformatted ... ok
+test tests::short_but_extreme_numbers_use_exponent_notation ... ok
+test tests::pipeline_from_dataset_to_files ... ok
+
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\circuit_session-b9f3cde3130a68f4.exe)
+
+running 9 tests
+test execute::tests::measurement_mapping_covers_every_kind ... ok
+test execute::tests::measure_request_round_trips_through_the_mapper ... ok
+test execute::tests::single_point_plan_turns_dc_into_op ... ok
+test execute::tests::sanitise_keeps_safe_characters ... ok
+test execute::tests::transient_is_preferred_for_measurements ... ok
+test format::tests::nested_values_render ... ok
+test format::tests::numbers_carry_their_unit ... ok
+test format::tests::other_values_keep_their_syntax ... ok
+test execute::tests::parameter_sweep_detection_ignores_source_sweeps ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests\session.rs (target\debug\deps\session-fd47a37915fd2827.exe)
+
+running 25 tests
+test a_body_statement_at_the_prompt_says_where_it_belongs ... ok
+test a_real_syntax_error_is_reported_immediately ... ok
+test a_variable_must_be_a_number ... ok
+test an_empty_line_produces_nothing ... ok
+test a_session_variable_does_not_leak_into_a_circuit ... ok
+test an_undefined_variable_is_reported_not_guessed ... ok
+test a_variable_can_be_defined_shown_and_reassigned ... ok
+test cancelling_an_input_keeps_the_session ... ok
+test a_circuit_parameter_is_not_visible_to_the_session ... ok
+test commands_are_not_part_of_the_language ... ok
+test a_failed_definition_leaves_variables_alone ... ok
+test diagnostics_point_into_the_input_that_produced_them ... ok
+test an_unfinished_input_is_continued_and_then_completed ... ok
+test expressions_show_their_type_by_value_not_by_silent_conversion ... ok
+test an_experiment_defined_before_its_circuit_is_refused_with_a_hint ... ok
+test definitions_and_variables_are_separate_namespaces ... ok
+test dimensions_propagate_through_session_arithmetic ... ok
+test an_override_for_a_parameter_that_does_not_exist_is_refused ... ok
+test help_list_and_reset_report_what_they_did ... ok
+test running_an_unknown_experiment_lists_the_defined_ones ... ok
+test a_redefinition_that_would_break_an_experiment_is_refused ... ok
+test a_run_uses_the_current_definition_not_a_cached_one ... ok
+test a_definition_is_replaced_only_when_it_compiles ... ok
+test an_explicit_override_changes_the_simulation ... ok
+test a_sweep_experiment_runs_through_the_session_too ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests circuit_backend
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests circuit_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests circuit_dsl
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests circuit_results
+
+running 1 test
+test crates\circuit-results\src\lib.rs - (line 23) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 0.54s; merged doctests compilation took 0.41s
+   Doc-tests circuit_session
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -1,0 +1,5 @@
+error[E_SYNTAX]: unexpected identifier `n`; expected the end of the statement
+  --> docs\review-evidence\cli-qa-output\inputs\syntax_error.cdsl:4:23
+   |
+4 |   resistor :r1, p: :a n: :gnd, value: 1.kohm
+  |                       ^

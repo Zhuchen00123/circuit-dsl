@@ -1,0 +1,13 @@
+﻿cargo :     Checking circuit-core v0.1.0 (F:\codexprojects\dsl000\crates\circuit-core)
+At line:1 char:260
++ ... TEXITCODE"; cargo clippy --workspace --all-targets -- -D warnings 2>& ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking ci...s\circuit-core):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Checking circuit-results v0.1.0 (F:\codexprojects\dsl000\crates\circuit-results)
+    Checking circuit-dsl v0.1.0 (F:\codexprojects\dsl000\crates\circuit-dsl)
+    Checking circuit-backend v0.1.0 (F:\codexprojects\dsl000\crates\circuit-backend)
+    Checking circuit-session v0.1.0 (F:\codexprojects\dsl000\crates\circuit-session)
+    Checking circuit-cli v0.1.0 (F:\codexprojects\dsl000\crates\circuit-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.11s

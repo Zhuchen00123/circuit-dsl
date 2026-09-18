@@ -1,0 +1,12 @@
+# QA input: the legal open output. r1 carries no current, but :b is
+# still DC-referenced to ground through r1 -> :a -> v1 -> gnd.
+circuit :open do
+  node :a, :b
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :b, value: 1.kohm
+end
+
+experiment :open_op, circuit: :open do
+  op
+  save v(:a), v(:b), i(:v1)
+end

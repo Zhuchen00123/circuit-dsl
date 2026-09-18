@@ -308,9 +308,19 @@ IR 的字段就是对外契约。
 | `AnalysisTask`（每个任务） | 单独构造一个只含该分析的 `CqCircuit`，再调对应的单分析入口 |
 
 每次 `run` 对每个任务构造一个新的 Thevenin 电路并只放一个 `Analysis`，
-避开多分析入口对 plot 排序与命名的依赖。`tran` 的 `step` 取
-`output_interval`（缺省为 `span/1000`）、`tmax` 取 `max_step`——两者不能混用，
-否则 `max_step` 会变成对输出网格的承诺（`docs/language.md` §5.1）。
+避开多分析入口对 plot 排序与命名的依赖。瞬态的三个概念在适配层分开：
+
+- `max_step` → 引擎 `tmax`（`h_max`），只约束**积分步长**；
+- `output_interval` → **不传给引擎**：求解结束后由 `circuit-results::resample` 把原始时间轴重采样
+  到等间隔输出网格（契约见 `docs/language.md` §5.3），它只改变展示与导出的采样点；
+- 引擎 print step（`Tran.step`）由 `thevenin.rs::tran_step_for` 算出：
+  `h_print = min(span/1000, 所有源声明的 rise/fall/period 最小值)`。这保证引擎对 PULSE 边沿的
+  `.max(tstep)` 夹取（`waveform.rs:37-38`）不会落在声明值上；声明边沿无法执行时在 `validate`
+  阶段报能力错误（`E_UNSUPPORTED` / `E_LIMIT`），**绝不静默展宽边沿**。
+
+因此 `circuit-session` 的 `RunOutcome` 有**两份**瞬态数据：`datasets` 是原始求解网格（测量来源），
+`output_datasets` 是重采样后的展示/导出视图（无 `output_interval` 时两者相同）。
+`avg`/`rms`/`max`/`min` 只在原始网格上计算，改输出采样不影响测量。
 
 引擎的以下行为由适配层补偿。这些不是猜测，而是 Phase-0 实测（`docs/backend-evaluation.md`
 §4.3、§4.6、§6）与 `crates/circuit-backend/src/thevenin.rs` 顶部注释记录的约束：
@@ -319,10 +329,11 @@ IR 的字段就是对外契约。
 |---|---|---|---|
 | `simulate_tran` 返回 `[op1, tran1]`，瞬态数据不在 `plots[0]` | `select_plot` 按小写名称前缀（`op`/`dc`/`ac`/`tran`）选 plot | 取 `plots[0]` 会静默返回工作点 | `tests/adapter.rs::rc_transient_matches_analytic`（若选错，轴不是时间轴，测试会以 "expected a time axis" 失败） |
 | 单分析入口**忽略** `circuit.save` | `build_circuit` 把 `save` 留空；`convert_plot` 只按 `task.probes` 物化信号 | 否则一次只要一个探针的运行会返回引擎的全部内部向量 | `tests/adapter.rs::only_requested_probes_are_returned`（断言信号名恰为 `["v(mid)"]`） |
-| `AcSpec.phase` 单位是**度**，本项目内部存弧度 | `map_ac` 做 `to_degrees()`；`sin` 波形的 `phi` 同样转换 | 混用会让每个相量整体旋转 | **没有数值测试**：测试与 DSL 的 `ac:` 都只产生 0 相位（`elaborate.rs` 构造 `AcSpec { phase_rad: 0.0 }`），转换代码只在 0 上走过路径 |
+| 两处相位单位相反：`AcSpec.phase` 与 `sin` 的 `phi` 在引擎里都是**度**，本项目内部都存弧度 | `map_source` 对两者都做 `to_degrees()`；反方向由 `elaborate` 的 `sin(..., phase:)` 分支做 `to_radians()` | 混用会让每个相量整体旋转 | **AC 源相位**：`tests/adapter.rs::ac_phase_is_converted_from_radians_to_degrees`（`phase_rad = π/2`，断言 `v(out) ≈ +0.5j`，实部 < 1e-9），本轮另加 `tests/phase_regression.rs` 覆盖多个非零角度、负相位与实/虚部。**`sin` 波形的 `phi`**：`tests/phase_regression.rs`（IR 直构）覆盖适配层换算；**DSL 层的 `sin(..., phase:)` 度→弧度换算此前在 `elaborate.rs` 与 `e2e.rs` 里都没有任何测试**（`grep -c phase crates/circuit-dsl/tests/elaborate.rs` = 0），本轮补 `crates/circuit-dsl/tests/phase_syntax_regression.rs`。**AC 源的相位目前没有 DSL 语法**（`elaborate.rs` 构造 `AcSpec { phase_rad: 0.0 }`），所以 AC 非零相位只能在 IR 层验证 |
 | `thevenin_types::Complex` 不是 `num_complex` | 在 `complex_of` / `make_signal` 边界转换成本项目自己的 `circuit_results::Complex` | `circuit-results` 不能依赖任何后端类型 | 间接覆盖：`rc_ac_matches_analytic`、`rlc_ac_matches_analytic`、`differential_probe_subtracts_complex_signals` 都在复数域比对解析解 |
 | 只有自带支路未知量的器件才有 `#branch` 电流（电压源、电感） | 电压源/电感直接读取；**电阻**用 `i = (v(p) - v(n)) / R` 推导；**电容、二极管、独立电流源**在 `validate` 阶段报 `E_UNSUPPORTED` 并说明原因 | brief 禁止伪造不可得的电流；推导只对线性电阻做，且必须被独立验证 | 推导：`divider_op_and_current_direction`（直流 KCL，`i(r1) = -i(v1)`，1e-12）、`derived_resistor_current_agrees_with_source_current_in_ac`（交流复数，相对误差 1e-9）；拒绝：`capacitor_current_is_refused_with_a_reason` |
-| 悬空节点**不报错**（gmin 把无直流通路的节点拉住） | **由前端补偿**：`circuit-core` 的 `connectivity` 模块做直流参考通路可达性检查，`circuit-dsl` 的 `finish_circuit` 在展开结束时调用并报 `E_NAME` | 引擎会返回貌似正常的有限值，所以只能在前端发现 | `circuit-core::connectivity` 单元测试（8 个）；`circuit-cli/tests/e2e.rs` 的 `check_rejects_a_node_with_no_dc_path_to_ground` 与 `check_accepts_an_ac_coupled_stage_with_a_bias_resistor` |
+| 真无参考的线性网络：引擎报 `matrix is singular, cannot solve`，但**不指向节点、也无法区分合法开路输出** | **由前端补偿**：`circuit-core` 的 `connectivity` 模块做直流参考通路可达性检查，`circuit-dsl` 的 `finish_circuit` 在展开结束时调用并报 `E_NAME`（含命中节点与阻断器件） | 单靠后端错误信息无法告诉用户哪个节点缺直流参考，也无法把「合法开路输出」与「真正无参考」分开 | `circuit-core::connectivity` 单元测试（9 个）；`circuit-dsl/tests/reference_path_regression.rs`；`circuit-cli/tests/e2e.rs` 的 `check_rejects_a_node_with_no_dc_path_to_ground` 与 `check_accepts_an_ac_coupled_stage_with_a_bias_resistor` |
+| PULSE 的 `tr`/`tf` 仍被夹到 `.tran` 步长（`thevenin-0.5.0/src/waveform.rs:37-38`） | 适配层自己取 `h_print = min(span/1000, min 声明 rise/fall/period)`（`thevenin.rs::tran_step_for`）；无法在步数预算内执行时报 `E_UNSUPPORTED` / `E_LIMIT` | 否则声明 `rise: 1.ns` 会被静默展宽成 print step（历史缺陷：适配层把 `output_interval` 送进了 `Tran.step`） | `tests/transient_reference_regression.rs::declared_rise_below_output_interval_is_not_widened`（含旧契约判别对照）、`tests/output_interval_regression.rs`、`_probe` 的 `tran_contract`（内核钳位事实） |
 
 补充说明：
 
@@ -343,7 +354,14 @@ IR 的字段就是对外契约。
   JSON 里也不声称。
 - `signals: Vec<Signal>`：每个信号有名字、`Dimension` 单位、`Data::Real | Data::Complex`。
   实数与复数保持区分，避免让 OP/DC/TRAN 的消费者处理恒为零的虚部。
-- `backend: BackendInfo`：引擎名、版本、设置项，随 JSON 一起落盘，便于复现。
+- `backend: BackendInfo`：引擎名、版本、设置项，随 JSON 一起落盘，便于复现。瞬态结果带有
+  `tran.solver_step` / `tran.solve_points` / `tran.waveform_bound` / `tran.max_step`（后端层），
+  以及重采样后才出现的 `tran.output_grid = resampled-linear` / `tran.output_points`（结果层），
+  因此"原始求解数据"与"输出采样"在元数据里可区分。
+- 输出采样：`resample`（`crates/circuit-results/src/resample.rs`）把瞬态结果重采样到
+  `output_interval` 指定的等间隔网格（起点/末点保留、线性插值、不越界外推、超
+  `Limits::max_result_values` 报 `E_LIMIT`）。会话层同时返回原始与重采样两份数据，
+  见 §5 的瞬态说明。
 - `diagnostics: Vec<Diagnostic>`：属于这个结果的警告（后端警告、导出警告）。
 - `Dataset::validate` 强制形状规则：每个信号的样本数必须等于轴长（或有轴时为 1）、
   信号名（大小写与空白不敏感地归一后）不得重复、标量值总数不得超过

@@ -1,0 +1,5 @@
+experiment `forward_drop` on circuit `diode_dc` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(vin), v(vout), i(r1)
+  dc1: 11 sweep points; signals: v(vin), v(vout), i(r1)
+  wrote docs\review-evidence\cli-qa-output\diode\forward_drop.op1.csv
+  wrote docs\review-evidence\cli-qa-output\diode\forward_drop.dc1.csv

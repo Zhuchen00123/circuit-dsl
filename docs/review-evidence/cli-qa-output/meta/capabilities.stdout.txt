@@ -1,0 +1,9 @@
+backend: thevenin 0.5.0
+analyses: op, dc, ac, tran
+devices: resistor, capacitor, inductor, voltage_source, current_source, diode
+source-value DC sweep: yes
+parameter DC sweep: yes (one elaboration per point, via the CLI)
+note: DC sweeps of a source value are executed natively.
+note: DC sweeps of a parameter are executed by the sweep driver in this crate, one elaboration per point.
+note: Transient output time points are solver-chosen and non-uniform; `max_step` bounds the internal step, not the output interval.
+note: Verified on Windows MSVC only.

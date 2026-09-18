@@ -1,0 +1,7 @@
+examples\voltage_divider.cdsl: 1 circuit(s), 1 experiment(s)
+  circuit divider: 3 nodes (2 signal), 3 devices, 0 models
+  voltage_source v1               p=in n=gnd
+  resistor   r1               p=in n=out
+  resistor   r2               p=out n=gnd
+  experiment `divider` on `divider`: 1 analysis task(s), 0 measure(s)
+    - op    save v(in), v(out), i(r1), i(v1)

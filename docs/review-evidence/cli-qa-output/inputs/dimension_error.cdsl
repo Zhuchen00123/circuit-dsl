@@ -1,0 +1,6 @@
+# QA input: a time literal where a resistance is required.
+circuit :bad_dimension do
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :gnd, value: 10.ms
+end

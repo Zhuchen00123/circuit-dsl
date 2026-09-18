@@ -100,21 +100,24 @@ pub fn run(
         CliFormat::Both => Format::Both,
     };
     let mut refusal: Option<u8> = None;
-    let written = write_datasets(
-        out,
-        format,
-        &outcome.datasets,
-        &mut |path| match guard_output(file, path) {
-            Ok(()) => Ok(()),
-            Err(code) => {
-                refusal = Some(code);
-                Err(Diagnostics::single(Diagnostic::error(
-                    Code::Io,
-                    format!("refusing to write `{}`", path.display()),
-                )))
-            }
-        },
-    );
+    // The output view, not the raw solver grid: when the experiment asked for
+    // an `output_interval:` these are the resampled traces (same file names).
+    let written =
+        write_datasets(
+            out,
+            format,
+            &outcome.output_datasets,
+            &mut |path| match guard_output(file, path) {
+                Ok(()) => Ok(()),
+                Err(code) => {
+                    refusal = Some(code);
+                    Err(Diagnostics::single(Diagnostic::error(
+                        Code::Io,
+                        format!("refusing to write `{}`", path.display()),
+                    )))
+                }
+            },
+        );
     if let Some(code) = refusal {
         return Err(code);
     }

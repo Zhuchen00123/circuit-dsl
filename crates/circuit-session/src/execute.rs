@@ -21,9 +21,22 @@ use circuit_results::dataset::{Axis, BackendInfo, Data, Dataset, Signal};
 use circuit_results::measure::{Measured, Measurement, measure_signal};
 
 /// What a run produced.
+///
+/// Two views of a transient run are kept apart on purpose (task A / plan §4):
+///
+/// - [`RunOutcome::datasets`] is the **raw solver output**: the time points the
+///   engine itself accepted. Measurements are computed from these, so changing
+///   `output_interval` can never move an `avg`/`rms`/`max`/`min`.
+/// - [`RunOutcome::output_datasets`] is what the user sees and exports. It
+///   equals the raw set unless the experiment asked for an `output_interval:`,
+///   in which case the trace is resampled onto that uniform grid
+///   (`circuit_results::resample`).
 #[derive(Clone, Debug)]
 pub struct RunOutcome {
     pub datasets: Vec<Dataset>,
+    /// The datasets to display and write; the raw ones when no output grid was
+    /// requested. Same order and names as [`RunOutcome::datasets`].
+    pub output_datasets: Vec<Dataset>,
     pub measures: Vec<Measured>,
     /// Warnings attached to datasets, kept so a caller can show them.
     pub warnings: Vec<String>,
@@ -31,8 +44,11 @@ pub struct RunOutcome {
 
 impl RunOutcome {
     /// A one-line description of each dataset, as the CLI prints them.
+    ///
+    /// Describes the **output** view: it is what the user is about to write to
+    /// disk, so the point count must match the file.
     pub fn summaries(&self) -> Vec<String> {
-        self.datasets
+        self.output_datasets
             .iter()
             .map(|d| {
                 let axis = match &d.axis {
@@ -117,13 +133,65 @@ pub fn execute<B: SimulationBackend>(
         .iter()
         .flat_map(|d| d.diagnostics.iter().map(|w| w.render_plain()))
         .collect();
+    // Measurements first, on the raw solver grid: a coarse output request
+    // must not change an integral (`avg`, `rms`) or an extreme.
     let measures = evaluate_measures(&elaborated.plan, &datasets);
+    let output_datasets = output_view(&elaborated.plan, &datasets, request.limits)?;
 
     Ok(RunOutcome {
         datasets,
+        output_datasets,
         measures,
         warnings,
     })
+}
+
+/// The trace as the user asked to see it.
+///
+/// A transient task with an explicit `output_interval` is resampled here, after
+/// the run and after the measurements, so the solver keeps its own steps and
+/// the declared source waveform keeps its declared edges. Every other analysis
+/// is returned unchanged.
+fn output_view(
+    plan: &AnalysisPlan,
+    datasets: &[Dataset],
+    limits: &Limits,
+) -> Result<Vec<Dataset>, Diagnostics> {
+    // One interval per transient task, in plan order: the backend names the
+    // nth transient result `tran{n}`, which is how a dataset finds its own
+    // task when an experiment runs more than one.
+    let tran_intervals: Vec<Option<f64>> = plan
+        .tasks
+        .iter()
+        .filter_map(|t| match &t.kind {
+            AnalysisKind::Tran(spec) => Some(spec.output_interval),
+            _ => None,
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(datasets.len());
+    for dataset in datasets {
+        let interval = if dataset.kind == "tran" {
+            let ordinal = dataset
+                .analysis
+                .strip_prefix("tran")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(1);
+            tran_intervals
+                .get(ordinal.saturating_sub(1))
+                .copied()
+                .flatten()
+        } else {
+            None
+        };
+        match interval {
+            Some(iv) => out.push(circuit_results::resample::resample_time(
+                dataset, iv, limits,
+            )?),
+            None => out.push(dataset.clone()),
+        }
+    }
+    Ok(out)
 }
 
 /// If the plan's only DC task sweeps a parameter, return its name and sweep.

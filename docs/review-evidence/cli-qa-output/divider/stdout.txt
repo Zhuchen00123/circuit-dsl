@@ -1,0 +1,4 @@
+experiment `divider` on circuit `divider` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(in), v(out), i(r1), i(v1)
+  wrote docs\review-evidence\cli-qa-output\divider\divider.op1.csv
+  wrote docs\review-evidence\cli-qa-output\divider\divider.op1.json

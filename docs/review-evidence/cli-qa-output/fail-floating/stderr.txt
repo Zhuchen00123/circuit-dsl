@@ -1,0 +1,7 @@
+error[E_NAME]: node `out` has no DC path to ground, so its operating point is undefined
+  --> docs\review-evidence\cli-qa-output\inputs\floating_capacitor.cdsl:4:13
+   |
+4 |   node :in, :out
+  |             ^^^^
+   = a capacitor or current source does not provide a DC reference path; add a resistor, inductor, voltage source or diode to ground
+   = attached but not conducting at DC: c1

@@ -325,6 +325,7 @@ ac from: 10.Hz, to: 10.MHz, points_per_decade: 50
 ac from: 10.Hz, to: 10.MHz, points: 100          # 线性等分
 tran stop: 30.us, max_step: 50.ns
 tran start: 10.us, stop: 30.us, max_step: 50.ns
+tran stop: 1.ms, max_step: 10.ns, output_interval: 1.us
 ```
 
 一个实验可声明**多个**分析。同种分析按出现顺序编号：两个 `ac` 分别是 `ac1` 与
@@ -337,8 +338,36 @@ tran start: 10.us, stop: 30.us, max_step: 50.ns
 **AC**：频率必须为正且 `to > from`。`points_per_decade` 与 `points`
 二选一。相位以弧度内部存储，输入输出用度。
 
-**TRAN**：`max_step` 是**最大内部步长**，不是输出间隔。
-返回的时间轴通常非均匀。`stop` 必须大于 `start` ≥ 0。
+**TRAN**：`stop` 必须大于 `start` ≥ 0。瞬态的三个概念互相独立：
+
+- `max_step`（可选）是**求解器的最大内部步长**（适配层把它映射到引擎的 `tmax`）。它不是输出
+  间隔：求解器可以取更小的步，返回的时间轴一般**非均匀**。
+- `output_interval`（可选）是**输出采样间隔**，只决定用户看到的采样点。它**不进入求解器**：
+  求解结束后，原始时间轴被重采样到以原始首点为起点、间隔为 `output_interval` 的网格上
+  （完整契约见 §5.3）。省略它时，输出就是求解器自己的时间轴。
+- 激励波形由电路里声明的 `pulse(...)`/`sin(...)`/`pwl(...)` 决定，**任何分析参数都不得展宽
+  它**。适配层取引擎的 print step = `min(span/1000, 所有源声明的 rise/fall/period 的最小值)`，
+  因此引擎对 PULSE 边沿的 `.max(tstep)` 夹取不会落在声明值上，声明 `rise: 1.ns` 就执行 1 ns。
+
+显式写出的值必须合法：
+
+- `max_step` / `output_interval` 为 0、负数或非有限（`NaN`、`inf`）→ `E_VALUE`，**不回退默认值**；
+- 声明源的 `rise`/`fall`/`period` 为 0 或非有限 → `E_UNSUPPORTED`（引擎没有理想零宽边沿）；
+- 声明的边沿相对仿真窗口过细 → `E_LIMIT`，但只针对**由声明波形导致的**超预算：当"存在已声明的
+  `rise`/`fall`/`period`"**且**"没有波形约束时同一 1e6 步预算不会被突破"时，诊断给出所需步数并带
+  `declared waveform timing` / `solver step` / `effective step`（如有 `max_step` 再加一项）context。
+  **只看 `max_step` 的配置不会被这条拒绝**：`max_step` 是用户自己的请求，例如纯直流源 + RC +
+  `tran stop: 1.s, max_step: 1.ns` 在 rev3 实测 `cdsl check` **exit 0**；后端也**不会**为了把运行
+  压进预算而静默展宽边沿（没有运行期步数上限，见 §5.3）。
+
+最小示例：
+
+```ruby
+tran stop: 1.ms, max_step: 10.ns, output_interval: 1.us
+```
+
+含义：积分步长上限 10 ns，输出每 1 µs 一个采样点；两者互不影响（改 `output_interval` 不改变
+波形与测量，只改变输出采样）。
 
 ### 5.2 探针
 
@@ -356,6 +385,48 @@ save v(:vin), v(:vout), v(:a, :b), i(:input)
   `E_NAME`：`` `internal` names 2 different nodes ``，并列出应改写的完整路径——
   不会静默挑一个。
 - 探针引用未声明的节点或器件报 `E_NAME`；重复探针报 `E_DUPLICATE`。
+
+### 5.3 输出采样与输出网格（`output_interval`）
+
+`output_interval:` 只在给出时启用，且只作用于 `tran`。求解器交出它自己的时间轴，输出视图在
+**求解之后**由独立的重采样得到（实现：`circuit-results` 的 `resample` 模块）：
+
+| 项 | 规则 |
+|---|---|
+| 网格起点 | 原始（求解器）时间轴的首点 `t0`，值直接复制 |
+| 内部点 | `t0 + k·output_interval`（`k = 1, 2, …`），只保留严格小于原始末点者 |
+| 终点 | 原始末点 `t_last` **恒保留**，因此最后一段可能短于 `output_interval` |
+| 插值 | 相邻两个原始样本上的线性插值；首末点取原值 |
+| 外推 | 禁止：每个输出点都落在 `[t0, t_last]` 内 |
+| 规模 | 输出值总数（输出点数 × 信号数）超过 `Limits::max_result_values` → `E_LIMIT`，不截断、不抽样 |
+| 省略时 | 输出网格 = 原始求解网格，逐点原样 |
+| 退化轴 | 原始点少于 2 个时无可插值，输出保持原样 |
+
+三条可依赖的性质：
+
+1. **改 `output_interval` 不改变激励波形与物理解**：它不进入求解器，不影响 PULSE 的
+   `rise`/`fall`，也不会延长或缩短仿真窗口。
+2. **改 `output_interval` 不改变测量**：`avg`/`rms`/`max`/`min` 一律在**原始求解网格**上计算
+   （§7）；重采样只改变展示与导出的采样点。
+3. **文件模式与 REPL 一致**：两者共用同一条执行路径，导出与摘要都用输出网格。结果元数据里
+   两种数据可区分——`cdsl run --format json` 的 `backend.settings` 记录
+   `tran.solver_step`、`tran.solve_points`、`tran.waveform_bound`、`tran.max_step`，以及
+   重采样层的 `tran.output_grid = resampled-linear`、`tran.output_points`。
+
+例：`tran stop: 10.us, max_step: 10.ns, output_interval: 100.ns` 返回约 101 个输出点；
+把 `output_interval` 改成 `10.ns` 只是把同一条解画得更密，`measure :vavg, avg: v(:out)`
+的值不变。
+
+**`check` 与 `run` 的边界**（实测）：`cdsl check` 是静态的 parse/elaborate，不求解、不重采样，
+因此**重采样规模的 `E_LIMIT` 只有 `run` 会报**；而 `max_step`/`output_interval` 的 `E_VALUE`、
+声明边沿的 `E_UNSUPPORTED`、以及**由声明波形（`rise`/`fall`/`period`）导致的**步数预算 `E_LIMIT`
+在 `check` 阶段即报。`max_step` 本身造成的步数超预算**不会**被拒绝（用户显式请求）。
+不要把它读成"`check` 能捕获全部运行时限制"。
+
+**运行期没有步数上限（既有限制）**：本项目不为求解过程设步数保护。即使 `check` 通过，极小的
+`max_step` 配合长窗口也可能需要极多求解步（例如纯直流源 + RC + `tran stop: 1.s, max_step: 1.ns`
+约 1e9 步），运行时间可能非常长；`Limits::max_result_values` 只在结果生成后生效，不阻止求解本身。
+该组合的**实际运行时长未实测**（修复前同样没有该保护，不是本轮引入）。
 
 ## 6. CLI 与结果
 
@@ -385,7 +456,7 @@ cdsl --version
 | OP | 无 | 实数 |
 | DC | 扫描参数（实数） | 实数 |
 | AC | 频率 Hz（对数或线性） | 复数 |
-| TRAN | 时间 s（非均匀） | 实数 |
+| TRAN | 时间 s（非均匀；给了 `output_interval` 则是等间隔网格，末点保留） | 实数 |
 
 ## 7. 测量
 
@@ -430,8 +501,10 @@ error[E_DIMENSION]: resistor.value 需要电阻量纲，实际为时间
 - 节点没有任何器件连接：`node ... is declared but nothing connects to it`
 - 节点只有电容或电流源连接：`node ... has no DC path to ground, ...`
 
-这样做是必要的：Phase-0 实测（见 `docs/backend-evaluation.md` §4.6）表明引擎不会报这种电路，
-它的 gmin 处理会让节点取到一个看似正常的有限值。
+这样做是必要的：实测（见 `docs/review-evidence/floating-audit.md`）表明引擎对真无参考的线性网络
+会以 `matrix is singular, cannot solve` 失败，但该错误不指向任何节点，也无法区分合法开路输出；
+前端因此自己做可达性检查，给出定位到节点与阻断器件的 `E_NAME`。
+（旧文档曾写「引擎的 gmin 处理会让节点取到看似正常的有限值」，该说法在本轮线性电路实测中不成立，已废弃。）
 
 无法定位时保留后端原始信息，不编造故障器件。
 
@@ -440,6 +513,12 @@ error[E_DIMENSION]: resistor.value 需要电阻量纲，实际为时间
 - 内部数值统一为 SI 基本单位。
 - 普通 R/L/C 要求**严格正值**；零值与负值报 `E_VALUE`，
   不会替换成很小的正数。
+- 瞬态选项必须显式合法：`max_step` / `output_interval` 为 0、负数或非有限报 `E_VALUE`，
+  **不回退默认值**；`output_interval` 只影响输出采样（§5.3），不进入求解器。
+- 声明的源边沿必须可执行：`rise`/`fall`/`period` 为 0 或非有限报 `E_UNSUPPORTED`；
+  **由声明波形导致的**步数预算超限（需要超过 1e6 个求解步）报 `E_LIMIT`，诊断给出所需步数与
+  归因 context；纯 `max_step` 造成的步数不会被这条拒绝（用户显式请求），运行期也没有步数上限
+  （§5.3）。不静默展宽边沿、不静默截断输出。
 - DSL 没有文件读写、网络、外部命令权限。
 - 首期不支持 `include` 与模型文件。
 - 仿真过程中不执行 DSL 脚本；展开完成后拓扑固定。
@@ -458,4 +537,13 @@ error[E_DIMENSION]: resistor.value 需要电阻量纲，实际为时间
 - REPL 的语法高亮、多行编辑、`:save` 回写文件、跨会话持久化（历史文件除外）。
 - 文件模式下的赋值：`name = value` 只属于 REPL，文件里用 `param`。
 - `uic`（跳过工作点）——后端路径未验证。
+- **运行期没有步数保护**：极小 `max_step` 配合长窗口可以通过 `check`（`max_step` 是用户显式请求，
+  不由波形契约拒绝），实际求解步数可能极多、运行时间非常长；该组合的运行时长**未实测**（§5.3）。
+- **运行中源断点的精度不是普适保证**：引擎在源断点后的首个被接受步强制 Backward-Euler
+  重启（`h1 = min(2·h_before, h_max)·0.1`），局部误差 ≈ `(V0/T)·h1²/(2τ)`。实测（τ = 100 µs、
+  上升斜坡 `V0/T = 1e6 V/s`、§17 判据 `atol = 1e-5 V` / `rtol = 1e-3`）：`max_step = τ/1000`
+  → 3129 点 0 超限、`τ/500` → 1629 点 0 超限；`τ/200` → 3/729 超限（max 1.248959e-5 V）；
+  `τ/50` → 250/309 超限（max 7.331775e-4 V）。经验界
+  `h_max ≤ 10·sqrt(2·atol·τ·T/V0)` 只对该激励推导，**不是通用保证**。产品路径没有容差通道
+  （`RELTOL`/`ABSTOL`/`TRTOL` 不可达）。详见 `docs/backend-evaluation.md` §5.1。
 - 跨平台：仅在 Windows MSVC 上构建验证过。

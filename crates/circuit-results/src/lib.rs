@@ -15,6 +15,8 @@
 //!   `abs`, `sqrt`, `min`, `max`, gain in dB) and its evaluator.
 //! - [`measure`] — `max`, `min`, `avg`, `rms`; the latter two as time
 //!   integrals on a non-uniform axis (spec §7).
+//! - [`resample`] — the independent output grid for `tran output_interval:`;
+//!   a view of the trace, never an input to the solver.
 //! - [`export`] — CSV and JSON, with a defined policy for non-finite samples
 //!   (`null` in JSON, an empty field in CSV, plus a warning).
 //!
@@ -55,6 +57,7 @@ pub mod dataset;
 pub mod export;
 pub mod expr;
 pub mod measure;
+pub mod resample;
 
 pub use dataset::{Axis, BackendInfo, Complex, Data, Dataset, Signal, normalize_signal_name};
 pub use export::{
@@ -63,6 +66,7 @@ pub use export::{
 };
 pub use expr::{Expr, Value, eval};
 pub use measure::{Measured, Measurement, measure, measure_signal, reduce};
+pub use resample::{OutputGrid, resample_time};
 
 /// Number formatting lives in `circuit-core` so the REPL, the CSV writer and
 /// the measurement summaries cannot drift apart. Re-exported here because this

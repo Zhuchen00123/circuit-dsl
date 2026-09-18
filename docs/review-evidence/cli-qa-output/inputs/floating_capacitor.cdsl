@@ -1,0 +1,7 @@
+# QA input: node :out is reachable from :in only through c1.
+# A capacitor is open at DC, so :out has no operating point.
+circuit :ac_coupled do
+  node :in, :out
+  voltage_source :v1, p: :in, n: :gnd, dc: 1.V
+  capacitor :c1, p: :in, n: :out, value: 1.uF
+end

@@ -475,12 +475,16 @@ impl<'a> Elaborator<'a> {
             }
         };
 
-        // The engine will not report an undetermined node: its gmin stepping
-        // keeps a floating node finite and returns success (see
-        // docs/backend-evaluation.md §4.6). So the DC reference-path check has
-        // to happen here, and it has to be a reachability test rather than a
-        // "does anything connect?" test, because a capacitor path is not a DC
-        // path (brief §9).
+        // Neither engine behaviour is a usable diagnostic (measured this
+        // round: docs/review-evidence/floating-audit.md, backend-contract.md).
+        // A linear unreferenced network fails with an unlocated
+        // "matrix is singular, cannot solve" error that names no node and
+        // cannot tell a legal open load from a real floating network; a
+        // non-linear one goes through Newton and its gmin stepping can return
+        // Ok with a gmin-dependent value. The check here turns both into an
+        // error that names the node and the blocking devices, and it has to be
+        // a reachability test rather than a "does anything connect?" test,
+        // because a capacitor path is not a DC path (brief §9).
         for f in circuit_core::floating_nodes(&circuit) {
             let node = circuit.node(f.node);
             let (message, note) = match f.kind {
@@ -2426,19 +2430,28 @@ impl<'a> Elaborator<'a> {
             Some(_) => Some(self.req_quantity(call, "max_step", TIME, &mut scope)?.value),
             None => None,
         };
+        // `is_finite` rejects NaN and infinities; `<= 0.0` then rejects zero
+        // and negatives. Together they mean "a finite value greater than
+        // zero", which is the whole contract for this option.
         if let Some(ms) = max_step
-            && ms <= 0.0
+            && (!ms.is_finite() || ms <= 0.0)
         {
             self.error(
-                Diagnostic::error(Code::Value, "`max_step:` must be greater than zero").at(call
-                    .arg("max_step")
-                    .unwrap()
-                    .value
-                    .span),
+                Diagnostic::error(
+                    Code::Value,
+                    "`max_step:` must be a finite number greater than zero",
+                )
+                .at(call.arg("max_step").unwrap().value.span),
             );
             return None;
         }
 
+        // `output_interval` is an *output sampling* request, not a solver
+        // parameter: it is implemented by resampling the solver's own time
+        // axis after the run (docs/language.md §5.3). An explicit value that is
+        // zero, negative or non-finite is a user error — falling back to a
+        // default here would silently discard what was written, which is
+        // exactly the behaviour this check exists to prevent.
         let output_interval = match call.arg("output_interval") {
             Some(_) => Some(
                 self.req_quantity(call, "output_interval", TIME, &mut scope)?
@@ -2446,6 +2459,32 @@ impl<'a> Elaborator<'a> {
             ),
             None => None,
         };
+        if let Some(oi) = output_interval
+            && (!oi.is_finite() || oi <= 0.0)
+        {
+            self.error(
+                Diagnostic::error(
+                    Code::Value,
+                    "`output_interval:` must be a finite number greater than zero",
+                )
+                .at(call.arg("output_interval").unwrap().value.span)
+                .with_note(
+                    "it sets the sampling of the returned waveform; omit it to keep the \
+                     solver's own time points",
+                ),
+            );
+            return None;
+        }
+
+        // `stop`/`start` bound the window the solver integrates over, so a
+        // non-finite value must not reach the backend either.
+        if !stop.value.is_finite() || !start.value.is_finite() {
+            self.error(
+                Diagnostic::error(Code::Value, "`tran stop:` and `start:` must be finite")
+                    .at(call.arg("stop").map(|a| a.value.span).unwrap_or(call.span)),
+            );
+            return None;
+        }
 
         Some(AnalysisKind::Tran(TranSpec {
             start_s: start.value,

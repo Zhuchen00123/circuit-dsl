@@ -1,0 +1,5 @@
+# QA input: a resistor network with no terminal on ground at all.
+circuit :island do
+  node :a, :b
+  resistor :r1, p: :a, n: :b, value: 1.kohm
+end

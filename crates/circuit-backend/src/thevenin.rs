@@ -14,9 +14,15 @@
 //!    data is not `plots[0]`, so plots are selected by name prefix.
 //! 2. **`circuit.save` is not honoured** by the single-analysis entry points.
 //!    Probe subsetting is done here.
-//! 3. **Floating nodes are not an error.** The engine's gmin keeps an
-//!    unreferenced node finite, so the DC-reference check lives in the front
-//!    end, not here.
+//! 3. **An unreferenced network is never reported as a node.** A linear one
+//!    returns `Err(... matrix is singular, cannot solve)`, which names no node
+//!    and cannot tell a legal open load from a real floating network; once a
+//!    non-linear device is present, the Newton path's gmin stepping can return
+//!    `Ok` with a gmin-dependent value instead. Neither tells the user which
+//!    node lost its DC reference, so the DC-reference check (and its
+//!    node-naming diagnostic) lives in the front end, not here. Measured this
+//!    round in `docs/review-evidence/floating-audit.md` and
+//!    `docs/review-evidence/backend-contract.md`.
 //! 4. **`thevenin_types::Complex` is its own type**, not `num_complex`.
 //! 5. **`AcSpec::phase` is in degrees**, while this project stores radians.
 //!    Conversion happens in [`map_ac`].
@@ -34,7 +40,7 @@ use circuit_core::ir::{
     self, Circuit, DeviceKind, ModelKind, NodeKind, SourceSpec as IrSourceSpec, Waveform,
 };
 use circuit_core::plan::{
-    AnalysisKind, AnalysisPlan, AnalysisTask, NamedProbe, Probe, SweepKind, SweepTarget,
+    AnalysisKind, AnalysisPlan, AnalysisTask, NamedProbe, Probe, SweepKind, SweepTarget, TranSpec,
 };
 use circuit_core::units::{self, Dimension, Quantity};
 use circuit_results::dataset::{Axis, BackendInfo, Complex, Data, Dataset, Signal};
@@ -102,7 +108,9 @@ impl TheveninBackend {
                  one elaboration per point."
                     .to_string(),
                 "Transient output time points are solver-chosen and non-uniform; `max_step` \
-                 bounds the internal step, not the output interval."
+                 bounds the internal step, not the output interval. A declared \
+                 `output_interval:` is honoured by resampling the solver's trace after the run, \
+                 so it changes neither the solve nor a declared source edge."
                     .to_string(),
                 "Verified on Windows MSVC only.".to_string(),
             ],
@@ -192,6 +200,27 @@ impl SimulationBackend for TheveninBackend {
                     // Parameter sweeps are run one elaboration per point by
                     // `crate::sweep`; this backend executes a single point.
                     SweepTarget::Parameter { .. } => {}
+                }
+            }
+
+            // The transient step contract is a capability question, not a
+            // runtime surprise: `check` must report a parameter set this
+            // backend cannot honour (task A / docs/next-iteration-plan.md).
+            if let AnalysisKind::Tran(spec) = &task.kind {
+                if let Some(ms) = spec.max_step
+                    && (!ms.is_finite() || ms <= 0.0)
+                {
+                    ds.push(
+                        Diagnostic::error(
+                            Code::Value,
+                            format!(
+                                "`max_step:` must be a finite number greater than zero, got {ms}"
+                            ),
+                        )
+                        .at(spec.span),
+                    );
+                } else if let Err(d) = tran_step_for(circuit, spec) {
+                    ds.extend(d);
                 }
             }
 
@@ -504,13 +533,23 @@ impl TheveninBackend {
 
         // A malformed result is fatal, but the warnings gathered while
         // materialising probes must not be lost on the way out.
+        //
+        // A transient result additionally records the solve configuration
+        // (solver step, step bound, waveform bound, raw point count) so the
+        // trace can be told apart from the solver grid it was derived from.
+        let mut info = backend_info.clone();
+        if let AnalysisKind::Tran(spec) = &task.kind {
+            for (key, value) in tran_settings(circuit, spec, axis.len()) {
+                info = info.with_setting(key, value);
+            }
+        }
         let mut dataset = match Dataset::new(
             plan.name.clone(),
             format!("{kind}{ordinal}"),
             kind,
             axis,
             signals,
-            backend_info.clone(),
+            info,
             &self.limits,
         ) {
             Ok(d) => d,
@@ -750,17 +789,27 @@ fn map_analysis(circuit: &Circuit, task: &AnalysisTask) -> Result<CqAnalysis, Di
         }),
 
         AnalysisKind::Tran(spec) => {
-            // `step` is the engine's print step, i.e. the requested output
-            // interval. `tmax` bounds the internal step. Conflating the two
-            // would make `max_step` a promise about the output grid, which
-            // spec §8.4 forbids.
-            let span = spec.stop_s - spec.start_s;
-            let step = spec
-                .output_interval
-                .filter(|s| *s > 0.0)
-                .unwrap_or_else(|| span / 1000.0);
+            // `tmax` is the engine's internal step bound (`h_max`), so it never
+            // promises anything about the output grid: the engine records every
+            // accepted internal step (measured, docs/review-evidence/
+            // backend-contract.md). `step` is the engine's print step
+            // (`h_print`), and it is *not* an output interval either — the
+            // engine has no output sampling. It is used in exactly three
+            // places: as the fallback for `h_max` when `tmax` is absent
+            // (`h_max = t_max.unwrap_or(min(tstep, tstop/50))`), as the floor
+            // of the integration step (`h_min = tstep * 1e-9`), and as the
+            // lower bound the PULSE `tr`/`tf` are clamped to — which means a
+            // declared rise time shorter than `step` would be silently
+            // widened.
+            //
+            // `output_interval` therefore does **not** reach this field: it is
+            // an output-sampling request, implemented by resampling the
+            // solver's trace after the run (circuit-results::resample). On this
+            // adapter it has no effect at all beyond being recorded as metadata
+            // (`tran_settings`, applied in `convert_plot`).
+            let h_print = print_step_for(circuit, spec)?;
             CqAnalysis::Tran(CqTran {
-                step,
+                step: h_print,
                 stop: spec.stop_s,
                 start: spec.start_s,
                 uic: spec.uic,
@@ -807,6 +856,216 @@ fn map_analysis(circuit: &Circuit, task: &AnalysisTask) -> Result<CqAnalysis, Di
             })
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Transient step contract
+// ---------------------------------------------------------------------------
+
+/// Upper bound on how many solver steps a **declared** waveform timing may
+/// force through the engine's print step (`h_print`).
+///
+/// The engine uses `h_print` as the floor of its integration step
+/// (`h_min = h_print * 1e-9`, `thevenin-0.5.0/src/transient.rs:1407`), as the
+/// growth cap in the no-LTE branch (`:1694`), and as the fallback for the step
+/// bound when `max_step` is absent (`:799`). A declared edge far below the
+/// simulation window therefore has a real cost, and the honest answer to a
+/// request the backend cannot execute within this budget is a capability
+/// error — never a silently widened edge.
+const MAX_PRINT_STEPS: f64 = 1_000_000.0;
+
+/// What the TRAN mapping decided.
+///
+/// Computed by one function so the analysis mapping, the capability check and
+/// the result metadata cannot disagree about the value that was handed to the
+/// engine.
+struct TranStep {
+    /// Value handed to the engine as `TranAnalysis::step` (`h_print`).
+    h_print: f64,
+    /// Smallest declared waveform timing the engine compares against `tstep`,
+    /// if this circuit declares any.
+    waveform_bound: Option<f64>,
+}
+
+/// The engine clamps several waveform parameters with `.max(tstep)` /
+/// `.unwrap_or(tstep)`, and uses the *clamped* values for its breakpoint table
+/// too (`thevenin-0.5.0/src/waveform.rs:37-38,271-278`). This function picks
+/// the print step so that clamp can never fire on a declared value.
+///
+/// The rule, in full:
+///
+/// ```text
+/// span          = stop - start
+/// default_print = span / 1000
+/// bound         = min over sources of the declared PULSE rise, fall, period
+/// h_print       = bound.min(default_print)      (default_print when none)
+/// ```
+///
+/// `output_interval` is deliberately absent: it is an output-sampling request
+/// and never reaches the solver (task A, docs/next-iteration-plan.md). It is
+/// re-applied after the run in `circuit-results::resample`.
+fn print_step_for(circuit: &Circuit, spec: &TranSpec) -> Result<f64, Diagnostics> {
+    Ok(tran_step_for(circuit, spec)?.h_print)
+}
+
+fn tran_step_for(circuit: &Circuit, spec: &TranSpec) -> Result<TranStep, Diagnostics> {
+    let mut bound: Option<f64> = None;
+    for device in &circuit.devices {
+        let Some(source) = device.source.as_ref() else {
+            continue;
+        };
+        let Some(Waveform::Pulse {
+            rise, fall, period, ..
+        }) = source.waveform.as_ref()
+        else {
+            // `sin` and `pwl` have no `tstep`-dependent parameter: the engine
+            // derives SIN's default frequency from `tstop` only.
+            continue;
+        };
+        for (name, q) in [("rise", rise), ("fall", fall), ("period", period)] {
+            if !q.value.is_finite() || q.value <= 0.0 {
+                return Err(Diagnostics::single(
+                    Diagnostic::error(
+                        Code::Unsupported,
+                        format!(
+                            "the backend cannot honour `{name}: {}` on source `{}`: \
+                             the engine substitutes its own print step for a zero or \
+                             non-finite timing, which would silently change the declared \
+                             waveform",
+                            q.value, device.name
+                        ),
+                    )
+                    .at(device.def_span)
+                    .with_context("source", device.name.clone())
+                    .with_note(
+                        "give the pulse a finite, positive rise, fall and period; \
+                         the engine has no ideal (zero-width) edge",
+                    ),
+                ));
+            }
+            bound = Some(bound.map_or(q.value, |b: f64| b.min(q.value)));
+        }
+    }
+
+    let span = spec.stop_s - spec.start_s;
+    let default_print = span / 1000.0;
+    let h_print = match bound {
+        Some(b) => b.min(default_print),
+        None => default_print,
+    };
+    if !h_print.is_finite() || h_print <= 0.0 {
+        return Err(Diagnostics::single(
+            Diagnostic::error(
+                Code::Value,
+                format!(
+                    "`tran` has a non-positive or non-finite window: start {} s, stop {} s",
+                    spec.start_s, spec.stop_s
+                ),
+            )
+            .at(spec.span)
+            .with_note("`stop:` must be greater than `start:` and both must be finite"),
+        ));
+    }
+
+    // Which step does the engine actually take?
+    //
+    // `h_print` only *caps* the step in the branch the engine takes when
+    // neither the circuit nor the device models give it an LTE estimate to
+    // work from (`transient.rs:1688-1696`, `min(h_max, h_print)`). As soon as a
+    // capacitor or inductor is present the LTE path runs, and there the step is
+    // bounded by `h_max` alone (`:1620-1681`). `h_max` is the declared
+    // `max_step` when there is one, and otherwise `min(h_print, stop/50)`
+    // (`:799`).
+    //
+    // This distinction matters: refusing every fine declared edge would reject
+    // legitimate runs, e.g. an RC whose integration is bounded by
+    // `max_step = tau/200` no matter how narrow the declared edge is.
+    let effective_step = effective_step_for(circuit, spec, h_print);
+
+    // Would the run be affordable even with no waveform constraint at all?
+    //
+    // This is the attribution test. When every source declares nothing, the
+    // print step is the engine's own window default (`span/1000`); if the same
+    // budget is exceeded there too, the cost comes from the user's explicit
+    // `max_step` — their own request, and refusing it is not this contract's
+    // business. Only a *declared waveform timing* can make the error below
+    // fire (found in review, W6-2: a purely resistive source set with
+    // `max_step: 1.ns` over 1 s used to be blamed on "declared source
+    // timings").
+    let effective_without_waveform = effective_step_for(circuit, spec, default_print);
+    let steps = span / effective_step;
+    let steps_without_waveform = span / effective_without_waveform;
+    if !steps.is_finite() || (steps > MAX_PRINT_STEPS && steps_without_waveform <= MAX_PRINT_STEPS)
+    {
+        let declared = bound.unwrap_or(default_print);
+        let mut d = Diagnostic::error(
+            Code::Limit,
+            format!(
+                "the declared source rise/fall/period is too fine for this simulation window: \
+                 honouring it would need about {:.0} solver steps, over the limit of {}",
+                steps.ceil(),
+                MAX_PRINT_STEPS
+            ),
+        )
+        .at(spec.span)
+        .with_context("declared waveform timing", format!("{declared} s"))
+        .with_context("solver step", format!("{h_print} s"))
+        .with_context("effective step", format!("{effective_step} s"));
+        if let Some(ms) = spec.max_step {
+            d = d.with_context("max_step", format!("{ms} s"));
+        }
+        return Err(Diagnostics::single(d.with_note(
+            "shorten `stop:`, use a longer `rise:`/`fall:`/`period:`, or set a `max_step:` \
+             no finer than the waveform needs; the edge is never widened silently to fit",
+        )));
+    }
+
+    Ok(TranStep {
+        h_print,
+        waveform_bound: bound,
+    })
+}
+
+/// The step the engine will actually take for `h_print`, given the circuit and
+/// the analysis' explicit `max_step`.
+///
+/// One function serves both the mapping and the attribution test above, so the
+/// two can never disagree about what the engine does.
+fn effective_step_for(circuit: &Circuit, spec: &TranSpec, h_print: f64) -> f64 {
+    let lte_controls = circuit
+        .devices
+        .iter()
+        .any(|d| matches!(d.kind, DeviceKind::Capacitor | DeviceKind::Inductor));
+    let h_max = spec
+        .max_step
+        .unwrap_or_else(|| h_print.min(spec.stop_s / 50.0));
+    if lte_controls {
+        h_max
+    } else {
+        h_max.min(h_print)
+    }
+}
+
+/// The `tran.*` settings a result carries, so a trace can be told apart from
+/// the raw solver grid it came from (plan §4 task A item 6).
+fn tran_settings(circuit: &Circuit, spec: &TranSpec, raw_points: usize) -> Vec<(String, String)> {
+    let Ok(step) = tran_step_for(circuit, spec) else {
+        return Vec::new();
+    };
+    let mut out = vec![
+        ("tran.solver_step".to_string(), format!("{}", step.h_print)),
+        ("tran.solve_points".to_string(), raw_points.to_string()),
+    ];
+    if let Some(b) = step.waveform_bound {
+        out.push(("tran.waveform_bound".to_string(), format!("{b}")));
+    }
+    if let Some(ms) = spec.max_step {
+        out.push(("tran.max_step".to_string(), format!("{ms}")));
+    }
+    if let Some(oi) = spec.output_interval {
+        out.push(("tran.output_interval".to_string(), format!("{oi}")));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,5 @@
+# QA input: a missing comma between the two named arguments.
+circuit :broken do
+  node :a
+  resistor :r1, p: :a n: :gnd, value: 1.kohm
+end

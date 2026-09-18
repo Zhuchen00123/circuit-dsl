@@ -448,6 +448,15 @@ impl BackendInfo {
         self.settings.push((key.into(), value.into()));
         self
     }
+
+    /// Read back a setting by key, for tests and for callers that report the
+    /// solve configuration next to a result.
+    pub fn setting(&self, key: &str) -> Option<&str> {
+        self.settings
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 // ---------------------------------------------------------------------------

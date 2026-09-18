@@ -1,0 +1,3 @@
+experiment `open_op` on circuit `open` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(a), v(b), i(v1)
+  wrote docs\review-evidence\cli-qa-output\open-output\results\open_op.op1.csv

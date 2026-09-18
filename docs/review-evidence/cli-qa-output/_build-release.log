@@ -1,0 +1,6 @@
+warning: linker stdout: 正在创建库 F:\codexprojects\dsl000\target\release\deps\cdsl.lib 和对象 F:\codexprojects\dsl000\target\release\deps\cdsl.exp
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `circuit-cli` (bin "cdsl") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.23s

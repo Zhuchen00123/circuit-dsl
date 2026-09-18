@@ -4,9 +4,31 @@
 #   ac    H(jw) = 1 / (1 + jwRC), corner at 1/(2*pi*R*C) = 1.5915 kHz
 #   tran  step response v(t) = 1 - exp(-t/tau), tau = R*C = 100 us
 #
-# Note that `max_step` bounds the solver's *internal* step. The time axis that
-# comes back is solver-chosen and is not uniformly spaced, which is why `avg`
-# and `rms` integrate over time rather than averaging samples.
+# Transient stimulus, measured this round on this exact file with
+#   cdsl run examples/rc_filter.cdsl --experiment response \
+#     --out target\round2-recon\r2\rc-filter --format csv      (exit 0)
+# The declared `rise: 1.ns` is delivered, not widened:
+#
+# * The adapter picks the engine's print step as
+#   min(span/1000, min(rise, fall, period)) = min(500 ns, 1 ns) = 1 ns, so the
+#   engine's `tr.unwrap_or(tstep).max(tstep)` clamp (waveform.rs:37) cannot
+#   bind. v(vin) reaches 1 V at t = 1 ns, and the result carries
+#   tran.solver_step = 1 ns / tran.waveform_bound = 1 ns.
+# * The 1019 samples of response.tran1.csv match the matched 1 ns-ramp analytic
+#   reference to max |err| = 7.916906e-7 V.
+# * Against the ideal step `1 - exp(-t/tau)` the same samples differ by at most
+#   4.921844e-6 V (at t = 1 ns). That residual is the physics of a 1 ns ramp,
+#   not solver error: C(T) = 1 - (tau/T)*(exp(T/tau) - 1) = -5.000007e-6 V for
+#   T = 1 ns. A checker comparing against the ideal step must allow for it;
+#   this round's regressions use the matched finite-ramp reference instead
+#   (crates/circuit-backend/tests/transient_reference_regression.rs).
+#
+# `max_step` bounds the solver's *internal* step and `output_interval` selects
+# the *output* sampling; they are independent. No `output_interval:` is given
+# here, so the exported trace is the solver's own (non-uniform) time grid; an
+# `output_interval:` would resample that trace after the solve without changing
+# the stimulus or the `avg`/`rms`/`max`/`min` measurements, which are computed
+# on the raw grid (docs/language.md §5.3).
 
 circuit :rc_filter do
   param :r, default: 1.kohm

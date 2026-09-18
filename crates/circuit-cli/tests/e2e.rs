@@ -123,9 +123,10 @@ fn check_reports_a_dimension_error_with_a_location() {
 
 /// A node reachable only through a capacitor has no defined operating point.
 ///
-/// The engine will not say so — its gmin stepping keeps the node finite and
-/// returns success — so the front end has to catch it. This is the case the
-/// brief singles out: "a capacitor path is not a DC reference path".
+/// The engine's own failure for this topology is an unlocated singular-matrix
+/// error that names no node, so the front end catches it and reports the node
+/// together with the blocking capacitor. This is the case the brief singles
+/// out: "a capacitor path is not a DC reference path".
 #[test]
 fn check_rejects_a_node_with_no_dc_path_to_ground() {
     let dir = scratch("floating");

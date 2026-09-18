@@ -610,7 +610,9 @@ impl Session {
         // A scalar analysis is short enough to show in full, and showing it is
         // the point of running one interactively. A sweep or a transient is
         // not: those get a pointer to `--out` instead of a page of numbers.
-        for d in &outcome.datasets {
+        // The output view is used so the point count matches what `--out`
+        // writes (raw and output differ when `output_interval:` is set).
+        for d in &outcome.output_datasets {
             if matches!(d.axis, circuit_results::dataset::Axis::None) {
                 for signal in &d.signals {
                     if let circuit_results::dataset::Data::Real(values) = &signal.data
@@ -646,7 +648,9 @@ impl Session {
 
         if let Some(dir) = out {
             let written =
-                execute::write_datasets(dir, Format::Both, &outcome.datasets, &mut |_| Ok(()))?;
+                execute::write_datasets(dir, Format::Both, &outcome.output_datasets, &mut |_| {
+                    Ok(())
+                })?;
             for path in written {
                 lines.push(format!("  wrote {}", path.display()));
             }

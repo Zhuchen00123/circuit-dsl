@@ -1,0 +1,12 @@
+error[E_NAME]: node `a` has no DC path to ground, so its operating point is undefined
+  --> docs\review-evidence\cli-qa-output\inputs\island.cdsl:3:8
+   |
+3 |   node :a, :b
+  |        ^^
+   = a capacitor or current source does not provide a DC reference path; add a resistor, inductor, voltage source or diode to ground
+error[E_NAME]: node `b` has no DC path to ground, so its operating point is undefined
+  --> docs\review-evidence\cli-qa-output\inputs\island.cdsl:3:12
+   |
+3 |   node :a, :b
+  |            ^^
+   = a capacitor or current source does not provide a DC reference path; add a resistor, inductor, voltage source or diode to ground

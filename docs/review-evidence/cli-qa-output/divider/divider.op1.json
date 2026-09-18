@@ -1,0 +1,54 @@
+{
+  "analysis": "op1",
+  "axis": {
+    "type": "none"
+  },
+  "backend": {
+    "name": "thevenin",
+    "settings": [
+      {
+        "key": "adapter",
+        "value": "0.1.0"
+      }
+    ],
+    "version": "0.5.0"
+  },
+  "diagnostics": [],
+  "experiment": "divider",
+  "kind": "op",
+  "schema": "circuit-dsl.result/1",
+  "signals": [
+    {
+      "name": "v(in)",
+      "type": "real",
+      "unit": "V",
+      "values": [
+        5.0
+      ]
+    },
+    {
+      "name": "v(out)",
+      "type": "real",
+      "unit": "V",
+      "values": [
+        3.0
+      ]
+    },
+    {
+      "name": "i(r1)",
+      "type": "real",
+      "unit": "A",
+      "values": [
+        0.002
+      ]
+    },
+    {
+      "name": "i(v1)",
+      "type": "real",
+      "unit": "A",
+      "values": [
+        -0.002
+      ]
+    }
+  ]
+}

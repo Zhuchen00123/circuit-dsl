@@ -1,0 +1,8 @@
+error[E_DIMENSION]: `r1.value` needs ohm, found s
+  --> docs\review-evidence\cli-qa-output\inputs\dimension_error.cdsl:5:40
+   |
+5 |   resistor :r1, p: :a, n: :gnd, value: 10.ms
+  |                                        ^^^^^
+   = expected: ohm
+   = received: s
+   = write e.g. `1.kohm` with a unit suffix

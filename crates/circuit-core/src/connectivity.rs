@@ -2,9 +2,24 @@
 //!
 //! The brief (§9) warns that "floating node" cannot be decided by asking
 //! whether *any* connection exists — a capacitor path is not a DC reference
-//! path — and the Phase-0 evaluation found that the engine will not tell us:
-//! Thevenin's gmin stepping keeps an unreferenced node finite and returns `Ok`
-//! (`docs/backend-evaluation.md` §4.6). So the check lives here.
+//! path. Two different things happen in the engine, and neither is a usable
+//! diagnostic (verified against the vendored source in this round):
+//!
+//! * A **linear** unreferenced network is solved directly and fails with an
+//!   unlocated `matrix is singular, cannot solve` error that names no node and
+//!   cannot distinguish a legal open load from a real floating network
+//!   (`thevenin-0.5.0/src/simulate.rs:77-83`).
+//! * Once a **non-linear** device is present the Newton path runs, and its
+//!   diagonal-gmin stepping (`thevenin-0.5.0/src/newton.rs:361-364`, with
+//!   `diag_gmin` forced to 0 for the operating point at
+//!   `thevenin-0.5.0/src/simulate.rs:99-102`) can return `Ok` with a finite,
+//!   gmin-dependent node voltage.
+//!
+//! Both measured in `docs/review-evidence/floating-audit.md` and
+//! `docs/review-evidence/backend-contract.md`. The earlier blanket claim in
+//! `docs/backend-evaluation.md` §4.6 ("the engine returns `Ok` and gmin keeps
+//! the node finite") describes only the second case and was recorded without
+//! that distinction. So the located, node-naming check lives here.
 //!
 //! # The rule
 //!
