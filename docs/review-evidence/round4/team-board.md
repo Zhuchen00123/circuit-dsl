@@ -45,4 +45,5 @@ The lead alone runs `cargo test --workspace`, `cargo clippy --workspace --all-ta
 | + | T13 docs-worker spawned (language/architecture/repl/testing/README); T14 reviewer running the phase-B matrix |
 | + | T14 complete: reviewer closed phase B PASS (22-row matrix, own inputs and hand derivations, 15/15 hashes stable); the three P3 items (docs wording, outdated test comment, QA evidence note) are fixed |
 | + | T13 complete: language/architecture/REPL/testing/README synced to the round-4 behaviour and to 660 tests; docs worker verified 22 CLI commands against the written examples |
+| + | user requested git management after the round closed: everything uncommitted since `8a4d569` (rounds 2-4: 80 files) committed as `097e955` and pushed to `origin/main`; remote ref verified equal to local HEAD |
 | + | **round 4 closed** — final gates on the frozen revision: `cargo test --workspace` 660 passed / 0 failed (exit 0), `clippy -D warnings` exit 0, `fmt --check` exit 0, all 7 examples `check` exit 0; logs in `target/round4/lead-gate/final-*.log`; summary in `final-summary.md`. No commit/push was made |

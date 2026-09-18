@@ -2,7 +2,13 @@
 
 Two phases, both closed by independent review: **A** (R4-01/R4-02/R4-03 plus the deep-expression
 regression the fixes exposed) and **B** (parameter DAG, cycles, topology propagation, check-time
-rejection). No commit, push or publish was made; every pre-existing uncommitted change was kept.
+rejection).
+
+**Repository state:** the team made no commit or push while the round ran; every pre-existing
+uncommitted change was kept. After the round closed, and at the user's explicit request, the whole
+uncommitted body of work (rounds 2-4) was committed as `097e955` and pushed to `origin/main`
+(`git@github.com:Zhuchen00123/circuit-dsl.git`); the remote ref was verified to equal the local
+HEAD afterwards.
 
 ## What was delivered
 
