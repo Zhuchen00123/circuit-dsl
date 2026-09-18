@@ -14,6 +14,10 @@ use crate::{EXIT_USER_ERROR, read_source};
 /// caller can render diagnostics against real source text.
 pub struct FrontEnd {
     pub sources: SourceMap,
+    /// The parsed program, kept so a caller that needs the definitions (the
+    /// parameter-sweep path re-elaborates per point) does not read and parse
+    /// the file a second time.
+    pub program: circuit_dsl::Program,
     pub compiled: circuit_dsl::Compiled,
 }
 
@@ -64,7 +68,11 @@ pub fn front_end(file: &Path, verbose: bool) -> Result<FrontEnd, u8> {
         eprintln!("checked `{}` successfully", file.display());
     }
 
-    Ok(FrontEnd { sources, compiled })
+    Ok(FrontEnd {
+        sources,
+        program,
+        compiled,
+    })
 }
 
 pub fn check(file: &Path, json: bool, verbose: bool) -> Result<(), u8> {

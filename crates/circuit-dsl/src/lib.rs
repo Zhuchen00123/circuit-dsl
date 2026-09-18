@@ -14,12 +14,16 @@
 //! solves it.
 
 pub mod ast;
+pub mod complete;
 pub mod elaborate;
+pub mod eval;
 pub mod lexer;
 pub mod parser;
 pub mod token;
 
 pub use ast::Program;
+pub use complete::{Completeness, assess};
 pub use elaborate::{Compiled, Elaborated, compile, elaborate_experiment};
+pub use eval::{Value, Variables, eval};
 pub use lexer::lex;
 pub use parser::parse;

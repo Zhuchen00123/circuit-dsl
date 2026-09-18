@@ -7,8 +7,9 @@
 # must give v(out) = 3.000 V and i(r1) = +2.000 mA.
 #
 # The sign is worth reading carefully: v1 sits between `in` and `gnd`, so the
-# current through it in the p -> n direction is negative (-1 mA), because it
-# delivers power. The current through r1, which absorbs it, is positive.
+# 2 mA it drives flows out of its `p` terminal into the divider, and the current
+# measured in the p -> n direction is therefore -2 mA: the source delivers
+# power. The current through r1, which absorbs it, is +2 mA.
 
 circuit :divider do
   node :in, :out

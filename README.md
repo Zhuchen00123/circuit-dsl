@@ -2,7 +2,7 @@
 
 ## 项目简介
 
-circuit-dsl 是一门描述模拟电路的小型领域语言，配一套纯 Rust 的实现：`.cdsl` 源文件声明电路、器件、参数与实验，命令行工具 `cdsl` 负责检查源文件、执行 op / dc / ac / tran 分析、求测量值并导出 CSV / JSON 结果。它面向可复现的小规模模拟电路验证：电路由结构化 IR 直接交给仿真后端构造，不生成 SPICE / Cirq 源文本，展开期的错误以带源码位置的诊断给出。工作区测试实测 `cargo test --workspace` 共 **309 个测试全部通过**（0 失败），`cargo clippy --workspace --all-targets -- -D warnings` 0 条警告，`cargo fmt --all -- --check` 无差异。
+circuit-dsl 是一门描述模拟电路的小型领域语言，配一套纯 Rust 的实现：`.cdsl` 源文件声明电路、器件、参数与实验，命令行工具 `cdsl` 负责检查源文件、执行 op / dc / ac / tran 分析、求测量值并导出 CSV / JSON 结果。`cdsl repl` 提供交互式会话：表达式即时求值、会话变量、逐条定义电路与实验并直接运行。它面向可复现的小规模模拟电路验证：电路由结构化 IR 直接交给仿真后端构造，不生成 SPICE / Cirq 源文本，展开期的错误以带源码位置的诊断给出。工作区测试实测 `cargo test --workspace` 共 **389 个测试全部通过**（0 失败），`cargo clippy --workspace --all-targets -- -D warnings` 0 条警告，`cargo fmt --all -- --check` 无差异。
 
 ## 快速开始
 
@@ -94,6 +94,7 @@ CSV 数值使用 SI 基本单位（V、A）；带轴的分析（dc / ac / tran�
 ```text
 cdsl check <FILE> [--json] [--verbose]
 cdsl run   <FILE> [--experiment <NAME>] [--out <DIR>] [--format csv|json|both] [--verbose]
+cdsl repl  [FILE]
 cdsl capabilities [--verbose]
 cdsl --version
 ```
@@ -102,9 +103,58 @@ cdsl --version
 |---|---|
 | `check <file>` | 跑完整前端（词法 → 语法 → 展开）并做后端能力校验，不执行任何分析。`--json` 打印展开后的电路与实验（含节点、器件、端子、探针）。 |
 | `run <file>` | 选择实验、执行分析、计算测量并写结果文件。`--experiment` 在文件只定义一个实验时可省略，否则必填。 |
+| `repl [file]` | 交互式会话：表达式即时求值（`1.kohm * 100.nF` → `100 us`），`r = 1.kohm` 定义会话变量，可以逐条定义电路 / 子电路 / 实验并 `:run`，还支持 `:load`、`:list`、`:reset`、`:help`。给出文件则先载入。完整说明见 [`docs/repl.md`](docs/repl.md)。 |
 | `capabilities` | 打印后端名称与版本、支持的分析、器件、扫描能力与备注。`--verbose` 追加 `Limits`（实测：max devices / nodes / loop iterations = 100000，max subcircuit depth = 16，max sweep points = 1000000，max result values = 50000000）。 |
 
 `run` 的默认值：`--out results`、`--format both`。结果文件按 `<experiment>.<analysis>` 命名，例如 `divider.op1.csv`、`response.ac1.csv`、`response.tran1.csv`；参数扫描为 `sweep.dc_param_r.csv`（轴名 `parameter`，单位为 SI 欧姆）。若输出目录不存在会自动创建；命令拒绝把结果写到输入源文件上。
+
+一段 REPL 会话（实际输出；多行输入用 `....> ` 续行提示）：
+
+```text
+$ cdsl repl examples/rc_filter.cdsl
+loaded `examples/rc_filter.cdsl`: defined circuit `rc_filter`, experiment `response`
+cdsl> r = 1.kohm
+r = 1 kohm
+cdsl> c = 100.nF
+c = 100 nF
+cdsl> tau = r * c
+tau = 100 us
+cdsl> :run response
+experiment `response` (backend thevenin 0.5.0)
+  op1: scalar; signals: v(vin), v(vout), i(input), i(r1)
+  ac1: 121 frequency points; signals: v(vin), v(vout), i(input), i(r1)
+  tran1: 1015 time points; signals: v(vin), v(vout), i(input), i(r1)
+  ...
+  measure vfinal = 993.245 mV
+  measure vavg = 800.851 mV
+  measure vrms = 837.972 mV
+```
+
+几条真实发生的错误（会话里先 `:load examples/voltage_divider.cdsl`）：
+
+```text
+cdsl> :run devider                 # 实验名拼错：列出真实存在的实验
+error[E_NAME]: no experiment named `devider` in this session
+   = defined: divider
+cdsl> :run divider r1=3.kohm       # 覆盖一个并不存在的参数：明确拒绝，不静默忽略
+error[E_NAME]: circuit `divider` has no parameter `r1`
+  --> examples/voltage_divider.cdsl:24:31
+   |
+24 | experiment :divider, circuit: :divider do
+   |                               ^^^^^^^^
+   = declared parameters: <none>
+   = an override that names nothing would silently leave every value at its default
+cdsl> load x.cdsl                  # 命令少写冒号
+error[E_SYNTAX]: `load` is a command; write `:load`
+  --> <repl:5>:1:1
+   |
+1 | load x.cdsl
+  | ^^^^
+   = commands are not part of the language, so they always start with `:`
+```
+
+注意 `r1=3.kohm` 在提示符下**不是**覆盖，而是一个名为 `r1` 的会话变量——覆盖只在
+`:run` 的参数位置出现，两者不会混淆。
 
 `--version` 实际输出：
 
@@ -199,6 +249,7 @@ note: Verified on Windows MSVC only.
 - [`docs/architecture.md`](docs/architecture.md) — 架构说明：前端 / IR / 后端 / 结果各层的职责与数据流。
 - [`docs/backend-evaluation.md`](docs/backend-evaluation.md) — 后端选型评估：准入用例、实测数据与适配层约束。
 - [`docs/testing.md`](docs/testing.md) — 测试说明：测试层次、覆盖范围与运行方式。
+- [`docs/repl.md`](docs/repl.md) — REPL 与语法审查：调用与语句的边界、会话作用域、多行输入的三态判定，以及哪些交互行为有测试、哪些没有。
 
 ## 项目结构
 
@@ -207,7 +258,8 @@ crates/circuit-core      语义 IR、单位与量纲、诊断码、展开 / 结�
 crates/circuit-dsl       词法器、语法分析器、展开器（子电路、循环 / 条件、参数覆盖、探针解析）
 crates/circuit-backend   SimulationBackend 抽象、Thevenin 0.5.0 适配层、参数扫描驱动
 crates/circuit-results   数据集与轴、测量求值（max/min/avg/rms）、CSV / JSON 导出
-crates/circuit-cli       cdsl 二进制：check / run / capabilities
+crates/circuit-session   会话状态与命令、实验执行（文件模式与 REPL 共用）
+crates/circuit-cli       cdsl 二进制：check / run / repl / capabilities
 _probe                   阶段 0 后端评估实验，独立于 workspace（exclude），作为可复现证据保留
 examples                 七个示例：voltage_divider、rc_filter、rlc、diode_rectifier、parameter_sweep、two_stage、ladder
 docs                     语言规范、架构、后端评估、测试说明

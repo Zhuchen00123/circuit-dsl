@@ -54,6 +54,36 @@ fn ok(src: &str) -> circuit_dsl::Compiled {
     }
 }
 
+/// Parse and elaborate a source, returning the program itself.
+fn parse_ok(src: &str) -> circuit_dsl::Program {
+    let mut sm = SourceMap::new();
+    let id = sm.add("test.cdsl", src);
+    let tokens = lex(id, src).unwrap_or_else(|d| {
+        panic!(
+            "lexes:
+{}",
+            d.render(&sm)
+        )
+    });
+    let program = parse(&tokens).unwrap_or_else(|d| {
+        panic!(
+            "parses:
+{}",
+            d.render(&sm)
+        )
+    });
+    // Compile once so a test that then elaborates a single experiment knows the
+    // source is sound on its own terms.
+    compile(&program, &Limits::default()).unwrap_or_else(|d| {
+        panic!(
+            "compiles:
+{}",
+            d.render(&sm)
+        )
+    });
+    program
+}
+
 /// Compile and expect failure; return the rendered diagnostics.
 fn err(src: &str) -> String {
     match run(src).result {
@@ -1423,4 +1453,169 @@ end
     ));
     assert_code(&text, Code::Name);
     assert!(text.contains("stage9.internal"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Rules fixed by the syntax review (docs/repl.md §3)
+// ---------------------------------------------------------------------------
+
+/// A parameter is a design parameter, so it belongs to the circuit body and
+/// not to elaboration-time control flow. Before this rule, a `param` inside a
+/// loop body was reported as "declared twice", which explained nothing.
+#[test]
+fn a_parameter_cannot_be_declared_inside_a_block() {
+    for body in [
+        "  for k in 1..2 do\n    param :w, default: 1\n  end\n",
+        "  if true do\n    param :w, default: 1\n  end\n",
+    ] {
+        let src = format!(
+            "circuit :c do\n  param :taps, default: 1\n  node :a\n  voltage_source :v1, p: :a, n: :gnd, dc: 1.V\n{body}end\n"
+        );
+        let text = err(&src);
+        assert_code(&text, Code::Unsupported);
+        assert!(text.contains("belongs in the circuit body"), "{text}");
+        // The message must name the fix, not just the rule.
+        assert!(text.contains("value:` expression"), "{text}");
+    }
+}
+
+/// The loop variable lives for one iteration: it is not a way to leave a value
+/// behind, and referring to it afterwards is an undeclared name.
+#[test]
+fn a_loop_variable_does_not_escape_its_loop() {
+    let text = err(r#"
+circuit :c do
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  for k in 1..3 do
+    resistor ("r" + k), p: :a, n: :gnd, value: 1.kohm
+  end
+  resistor :after, p: :a, n: :gnd, value: k * 1.kohm
+end
+"#);
+    assert_code(&text, Code::Name);
+    assert!(text.contains("`k` is not declared"), "{text}");
+}
+
+#[test]
+fn a_loop_variable_may_reuse_a_name_from_the_enclosing_body() {
+    // The loop variable is saved and restored, so this is legal and the
+    // parameter keeps its value afterwards.
+    let c = ok(r#"
+circuit :c do
+  param :k, default: 5.kohm
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  for k in 1..2 do
+    resistor ("r" + k), p: :a, n: :gnd, value: 1.kohm
+  end
+  resistor :after, p: :a, n: :gnd, value: k
+end
+"#);
+    let circuit = &c.circuits[0];
+    let after = circuit
+        .device(circuit.device_id("after").expect("after"))
+        .unwrap();
+    assert_eq!(after.param("value").unwrap().value, 5000.0);
+}
+
+/// Concatenation is triggered by a string, and a value with a unit never
+/// becomes text: `"r" + 1.kohm` would be indistinguishable from `"r" + 1000`.
+#[test]
+fn name_concatenation_converts_only_what_is_unambiguous() {
+    // A dimensionless number, a symbol and a boolean do convert.
+    let c = ok(r#"
+circuit :c do
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor ("r" + 1), p: :a, n: :gnd, value: 1.kohm
+  resistor ("s" + :x), p: :a, n: :gnd, value: 1.kohm
+  resistor ("t" + true), p: :a, n: :gnd, value: 1.kohm
+end
+"#);
+    let names: Vec<&str> = c.circuits[0]
+        .devices
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    assert!(names.contains(&"r1"), "{names:?}");
+    assert!(names.contains(&"sx"), "{names:?}");
+    assert!(names.contains(&"ttrue"), "{names:?}");
+
+    // A dimensioned number does not: the unit would be silently dropped.
+    let text = err(r#"
+circuit :c do
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor ("r" + 1.kohm), p: :a, n: :gnd, value: 1.kohm
+end
+"#);
+    assert_code(&text, Code::Type);
+    assert!(text.contains("cannot join"), "{text}");
+
+    // Neither does an array.
+    let text = err(r#"
+circuit :c do
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor ("r" + [1]), p: :a, n: :gnd, value: 1.kohm
+end
+"#);
+    assert_code(&text, Code::Type);
+}
+
+/// An override that names no parameter would silently leave every value at its
+/// default, so it is an error rather than a no-op.
+#[test]
+fn an_override_must_name_a_declared_parameter() {
+    let program = parse_ok(
+        r#"
+circuit :c do
+  param :r, default: 1.kohm
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :gnd, value: r
+end
+experiment :e, circuit: :c do
+  op
+  save v(:a)
+end
+"#,
+    );
+
+    // The declared parameter is accepted.
+    let overrides = vec![("r".to_string(), units::Quantity::ohms(2000.0))];
+    assert!(
+        elaborate_experiment(&program, "e", &overrides, &Limits::default()).is_ok(),
+        "overriding `r` must work"
+    );
+
+    // A name the circuit does not declare is refused, with the real list.
+    let overrides = vec![("r1".to_string(), units::Quantity::ohms(2000.0))];
+    let diagnostics = elaborate_experiment(&program, "e", &overrides, &Limits::default())
+        .expect_err("`r1` is a device, not a parameter");
+    let text = diagnostics.render_plain();
+    assert!(text.contains("has no parameter `r1`"), "{text}");
+    assert!(text.contains("declared parameters: r"), "{text}");
+}
+
+/// An experiment's own `param` override is the same chain, so a typo there is
+/// caught the same way.
+#[test]
+fn an_experiment_override_must_name_a_declared_parameter() {
+    let text = err(r#"
+circuit :c do
+  param :r, default: 1.kohm
+  node :a
+  voltage_source :v1, p: :a, n: :gnd, dc: 1.V
+  resistor :r1, p: :a, n: :gnd, value: r
+end
+experiment :e, circuit: :c do
+  param :rr, value: 2.kohm
+  op
+  save v(:a)
+end
+"#);
+    assert_code(&text, Code::Name);
+    assert!(text.contains("has no parameter `rr`"), "{text}");
 }

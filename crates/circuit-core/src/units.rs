@@ -381,6 +381,26 @@ const PREFIXES: &[Prefix] = &[
     },
 ];
 
+/// The canonical decimal prefix for display, one symbol per exponent.
+///
+/// This is the *output* counterpart of [`PREFIXES`]: the parser accepts several
+/// spellings per exponent (`k`/`K`, `u`/`µ`/`μ`, `meg`/`MEG`), while display
+/// picks one. `display_prefixes_round_trip_through_the_parser` keeps the two
+/// tables from drifting apart.
+pub const DISPLAY_PREFIXES: &[(i32, &str)] = &[
+    (-18, "a"),
+    (-15, "f"),
+    (-12, "p"),
+    (-9, "n"),
+    (-6, "u"),
+    (-3, "m"),
+    (0, ""),
+    (3, "k"),
+    (6, "M"),
+    (9, "G"),
+    (12, "T"),
+];
+
 /// Resolve a unit suffix such as `kohm`, `nF`, `us`, `MHz`.
 ///
 /// Returns the SI scale factor and the dimension. This is a closed lookup —
@@ -651,5 +671,24 @@ mod tests {
             build_quantity("1", Some("xV")).unwrap_err(),
             UnitParseError::UnknownUnit("xV".into())
         );
+    }
+
+    /// Whatever [`DISPLAY_PREFIXES`] prints must parse back to the same
+    /// exponent, or the REPL would show a value the language cannot read back.
+    #[test]
+    fn display_prefixes_round_trip_through_the_parser() {
+        for &(exponent, symbol) in DISPLAY_PREFIXES {
+            for base in BASE_UNITS {
+                let suffix = format!("{symbol}{}", base.symbol);
+                let (scale, dimension) =
+                    resolve_unit_suffix(&suffix).unwrap_or_else(|| panic!("`{suffix}` must parse"));
+                assert_eq!(dimension, base.dimension, "{suffix}");
+                assert_eq!(
+                    scale,
+                    10f64.powi(exponent),
+                    "`{suffix}` scales by 10^{exponent}"
+                );
+            }
+        }
     }
 }

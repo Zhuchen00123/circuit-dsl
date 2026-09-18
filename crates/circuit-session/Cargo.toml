@@ -1,0 +1,12 @@
+[package]
+name = "circuit-session"
+version = "0.1.0"
+edition = "2024"
+description = "Session state and experiment execution, shared by the CLI and the REPL"
+license = "BSD-3-Clause"
+
+[dependencies]
+circuit-core = { path = "../circuit-core" }
+circuit-dsl = { path = "../circuit-dsl" }
+circuit-backend = { path = "../circuit-backend" }
+circuit-results = { path = "../circuit-results" }

@@ -517,10 +517,10 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     self.push(TokenKind::EqEq, start);
                 } else {
-                    self.report(
-                        start,
-                        "`=` is not an operator; the language has no assignment",
-                    );
+                    // Single `=`. In the REPL this defines a session variable;
+                    // in a circuit body the parser reports it with a pointer to
+                    // `param`, which is the construct that belongs there.
+                    self.push(TokenKind::Assign, start);
                 }
             }
             '&' => {
@@ -1075,23 +1075,35 @@ mod tests {
 
     #[test]
     fn lone_assignment_operators_are_rejected() {
-        let d = diagnostics("a = b");
-        assert_eq!(d.len(), 1);
-        let first = d.iter().next().unwrap();
-        assert_eq!(first.code, Code::Syntax);
-        assert!(
-            first.message.contains("no assignment"),
-            "got {}",
-            first.message
+        // `=` itself is now a token; the parser decides whether it is an
+        // assignment (REPL) or a mistake (a circuit body).
+        assert_eq!(
+            kinds("a = b"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::Assign,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof
+            ]
         );
-        let label = first.primary.as_ref().expect("a primary span");
-        assert_eq!((label.span.start, label.span.end), (2, 3));
 
         assert!(diagnostics("a & b").has_errors());
         assert!(diagnostics("a | b").has_errors());
         // But the doubled forms are fine.
         assert_eq!(kinds("a && b")[1], TokenKind::AmpAmp);
         assert_eq!(kinds("a || b")[1], TokenKind::PipePipe);
+    }
+
+    /// `==`, `!=`, `<=`, `>=` and `=>` must not be shadowed by the new `=`.
+    #[test]
+    fn assignment_does_not_swallow_the_comparison_operators() {
+        assert_eq!(kinds("a == b")[1], TokenKind::EqEq);
+        assert_eq!(kinds("a != b")[1], TokenKind::BangEq);
+        assert_eq!(kinds("a <= b")[1], TokenKind::Le);
+        assert_eq!(kinds("a >= b")[1], TokenKind::Ge);
+        assert_eq!(kinds("{ a => b }")[2], TokenKind::FatArrow);
+        // And a lone `=` is exactly one token.
+        assert_eq!(kinds("a = b")[1], TokenKind::Assign);
     }
 
     #[test]

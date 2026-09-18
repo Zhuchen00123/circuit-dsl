@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod check;
+mod repl;
 mod run;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -72,6 +73,15 @@ pub enum Command {
 
     /// List the available backend and what it supports.
     Capabilities,
+
+    /// Start an interactive session.
+    ///
+    /// Evaluates expressions, defines circuits and experiments, and runs them.
+    /// `:help` lists the commands; see docs/repl.md.
+    Repl {
+        /// Load this file into the session before the first prompt.
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
@@ -105,6 +115,7 @@ fn main() -> ExitCode {
             check::capabilities(cli.verbose);
             Ok(())
         }
+        Command::Repl { file } => repl::repl(file.as_deref(), cli.verbose),
     };
 
     match result {

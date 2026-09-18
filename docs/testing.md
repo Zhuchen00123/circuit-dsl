@@ -111,28 +111,41 @@ test result: ok. 15 passed; 0 failed;  ...   （circuit-backend lib）
 test result: ok. 21 passed; 0 failed;  ...   （circuit-backend tests/adapter.rs）
 test result: ok.  9 passed; 0 failed;  ...   （circuit-cli bin）
 test result: ok. 18 passed; 0 failed;  ...   （circuit-cli tests/e2e.rs）
-test result: ok. 46 passed; 0 failed;  ...   （circuit-core lib）
-test result: ok. 67 passed; 0 failed;  ...   （circuit-dsl lib）
-test result: ok. 61 passed; 0 failed;  ...   （circuit-dsl tests/elaborate.rs）
+test result: ok. 11 passed; 0 failed;  ...   （circuit-cli tests/repl.rs）
+test result: ok. 58 passed; 0 failed;  ...   （circuit-core lib）
+test result: ok. 84 passed; 0 failed;  ...   （circuit-dsl lib）
+test result: ok. 67 passed; 0 failed;  ...   （circuit-dsl tests/elaborate.rs）
 test result: ok. 71 passed; 0 failed;  ...   （circuit-results lib）
+test result: ok.  9 passed; 0 failed;  ...   （circuit-session lib）
+test result: ok. 25 passed; 0 failed;  ...   （circuit-session tests/session.rs）
 test result: ok.  0 passed; ...              （circuit-backend / circuit-core / circuit-dsl 的 doc-tests）
 test result: ok.  1 passed; ...              （circuit-results 的 doc-test）
 ```
 
-**合计 309 个测试，全部通过。**（15+21+9+18+46+67+61+71+1 = 309；三个 0 的 doc-test
-目标不计。）`cargo nextest run --workspace` 报 308：nextest 不跑 doc-test，
+**合计 389 个测试，全部通过。**（15+21+9+18+11+58+84+67+71+9+25+1 = 389；三个 0 的
+doc-test 目标不计。）`cargo nextest run --workspace` 报 388：nextest 不跑 doc-test，
 差值就是那一个 doc-test。
 
 | crate | 测试数 | 明细 | 覆盖内容 |
 |---|---|---|---|
-| `circuit-core` | 46 | `units` 12、`ir` 9、`connectivity` 9、`span` 6、`plan` 4、`diagnostic` 3、`limits` 2、`id` 1 | 单位后缀与量纲运算、IR 构造与索引不变量、直流参考路径可达性、源码位置/行列/caret、AC 点数约定、诊断渲染、限制默认值 |
-| `circuit-dsl` | 67（lib）+ 61（`tests/elaborate.rs`）= 128 | lib：`parser` 32、`lexer` 24、`ast` 7、`token` 4 | 词法（续行、量纲字面量、注释、错误恢复、`...` 与字符串插值的拒绝）、语法（优先级、块、错误、层次路径）、展开（参数、层次、循环、条件、分析、诊断、限制） |
+| `circuit-core` | 58 | `units` 13、`format` 11、`ir` 9、`connectivity` 9、`span` 6、`plan` 4、`diagnostic` 3、`limits` 2、`id` 1 | 单位后缀与量纲运算、**工程计数法显示与"显示出来的单位一定能读回来"**、IR 构造与索引不变量、直流参考路径可达性、源码位置/行列/caret、AC 点数约定、诊断渲染、限制默认值 |
+| `circuit-dsl` | 84（lib）+ 67（`tests/elaborate.rs`）= 151 | lib：`parser` 36、`lexer` 25、`complete` 12、`ast` 7、`token` 4 | 词法（续行、量纲字面量、注释、错误恢复、`...`/插值/`=` 的处置）、语法（优先级、块、错误、层次路径、**REPL 输入的四态与针对性提示**）、**多行输入的三态判定**、展开（参数、层次、循环、条件、分析、诊断、限制、**参数位置与覆盖校验**） |
 | `circuit-results` | 71（lib）+ 1（doc-test）= 72 | `expr` 23、`measure` 16、`dataset` 14、`export` 14、lib 4 | 表达式求值与量纲、积分/极值、数据形状校验、CSV/JSON 与非有限值策略、端到端 doc 示例 |
 | `circuit-backend` | 15（lib）+ 21（`tests/adapter.rs`）= 36 | lib：`sweep` 10、`backend` 5 | 扫描坐标与拓扑比较、失败分类；适配层与真实引擎的数值对比、推导电流（含接地端与 AC）、分析命名、诊断去重 |
-| `circuit-cli` | 9（bin）+ 18（`tests/e2e.rs`）= 27 | bin：`run` 6、`main` 3 | 单点计划转换、扫描检测、测量取值顺序、CLI 定义、防覆盖输入；端到端命令与数值 |
+| `circuit-session` | 9（lib）+ 25（`tests/session.rs`）= 34 | lib：`execute` 6、`format` 3 | 执行器（单点计划转换、扫描检测、测量优先级）、值显示；**会话行为**：变量、续行、定义替换与回滚、命名空间、作用域边界、覆盖、命令 |
+| `circuit-cli` | 9（bin）+ 18（`tests/e2e.rs`）+ 11（`tests/repl.rs`）= 38 | bin：`repl` 6、`run` 3 | CLI 定义与防覆盖输入、端到端命令与数值；**真实进程的管道会话**（定义→运行→改参→再运行、`:load`、冲突、`:run --out`、退出码） |
 
-`cargo test --workspace` 的耗时主要在端到端测试：它要真的起进程、跑仿真，
-实测约 2–3 秒；适配层测试（真跑引擎）约 0.1 秒；其余测试目标都在一秒以内。
+测试分层，以及为什么这样分：
+
+- `circuit-dsl` 与 `circuit-session` 的测试直接驱动库，不做 I/O，因此毫秒级。
+- `circuit-backend/tests/adapter.rs` 真的跑仿真引擎（数值对照，约 0.1 秒）。
+- `circuit-cli/tests/*.rs` 真的起进程：`e2e.rs` 跑文件模式，`repl.rs` 用管道驱动
+  交互会话——**会话逻辑不依赖终端库**，所以它在没有 TTY 的环境里也能端到端验证。
+- 终端按键（Ctrl+C/Ctrl+D/历史/补全）需要真实 TTY，无法自动化；本轮把交互路径里
+  可测的部分拆成了函数并加了测试，边界写清楚在 `docs/repl.md` §8。
+
+`cargo test --workspace` 实测约 16 秒（端到端测试占大头，它们要起进程、跑仿真）；
+`cargo nextest run --workspace` 约 16 秒。
 
 ## 4. 数值验证
 
@@ -165,6 +178,9 @@ test result: ok.  1 passed; ...              （circuit-results 的 doc-test）
 | 二极管 DC 扫描（CLI） | 10 倍电流的压降变化量 | 压降都在 0.3–0.8 V，变化量 0.01–0.15 V |
 | DC 源扫描 | `v(mid)=0.5·Vsweep`，6 点 | 1e-12 |
 | 参数扫描（CLI） | `v(out)=3·1.5k/(r+1.5k)`，8 点 | 1e-9 |
+| 会话显式覆盖（session） | 5 V 分压：默认 `r1=1k` → `v(out)=2.5 V`；`r1=3k` → `1.25 V` | 1e-9，且两次运行不互相影响 |
+| 会话运行真实进程（CLI `tests/repl.rs`） | 同一段脚本里的两次数值必须不同（2.5 V → 1.25 V） | 1e-9 |
+| 示例载入并运行（CLI `tests/repl.rs`） | `voltage_divider.cdsl`：`v(out)=3 V`、`i(r1)=2 mA` | 字符串断言，取自示例注释的承诺值 |
 | 循环建梯形网络（CLI，`examples/ladder.cdsl`） | 节点方程解：`v(midk)=1.5/2^{k-1}`、`i(r0)=1.5 mA`、`i(rs1)=0.75 mA` | 1e-9 |
 | 层次探针（IR，`v(:stage1.internal)`、`i(:stage1.r1)`） | 解析到实例内部的节点/器件 id，与非限定叶名（唯一时）等价 | 全等，`name` 为 `v(stage1.internal)` |
 | 层次探针 AC（CLI，`two_stage.cdsl --experiment inside`，1 MHz） | 独立复数节点分析（6 节点、含两只电容与负载电容） | 实部/虚部逐位一致（< 1e-15） |

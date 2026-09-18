@@ -19,7 +19,7 @@ use crate::ast::{
     ExperimentDef, Expr, ExprKind, ForIter, ForStmt, IfStmt, InstanceStmt, ModelDecl, NodeDecl,
     ParamDecl, Program, SpannedName, Stmt, UnaryOp,
 };
-use crate::token::{Token, TokenKind, is_reserved_name};
+use crate::token::{Token, TokenKind, is_keyword, is_reserved_name};
 
 /// Parse a whole file.
 ///
@@ -32,6 +32,123 @@ pub fn parse(tokens: &[Token]) -> Result<Program, Diagnostics> {
     } else {
         Err(parser.diagnostics)
     }
+}
+
+/// One interactive input: what a REPL line, or an accumulated multi-line
+/// buffer, means.
+///
+/// The language has no assignment statement — a circuit's parameters are
+/// declared with `param` — so `Assign` exists only here, at the session top
+/// level, where it defines a session variable.
+#[derive(Clone, Debug)]
+pub enum Input {
+    /// Nothing but whitespace and comments.
+    Empty,
+    /// `name = expr`.
+    Assign {
+        name: String,
+        name_span: SourceSpan,
+        value: Expr,
+    },
+    /// An expression to evaluate and show.
+    Expr(Expr),
+    /// One or more top-level definitions.
+    Program(Program),
+}
+
+/// What parsing an interactive input produced.
+#[derive(Clone, Debug)]
+pub struct Parsed {
+    /// The input, when it parsed.
+    pub input: Option<Input>,
+    pub diagnostics: Diagnostics,
+    /// Whether at least one error was reported with the cursor at the end of
+    /// the input.
+    ///
+    /// This is how "more text could finish it" looks from the parser's side,
+    /// and it is deliberately narrow: `node 5` and a stray `end` are errors
+    /// about something the parser *did* read, so neither sets this flag. A
+    /// REPL uses it, together with a structural check, to tell a half-typed
+    /// line from a wrong one.
+    pub ran_out: bool,
+}
+
+impl Parsed {
+    pub fn is_ok(&self) -> bool {
+        self.input.is_some() && !self.diagnostics.has_errors()
+    }
+}
+
+/// Parse one interactive input, reporting why it failed.
+pub fn parse_input_detailed(tokens: &[Token]) -> Parsed {
+    let mut parser = Parser::new(tokens);
+    let input = parser.input();
+    let ok = !parser.diagnostics.has_errors();
+    Parsed {
+        input: ok.then_some(input),
+        diagnostics: parser.diagnostics,
+        ran_out: parser.ran_out,
+    }
+}
+
+/// Parse one interactive input.
+pub fn parse_input(tokens: &[Token]) -> Result<Input, Diagnostics> {
+    let parsed = parse_input_detailed(tokens);
+    match parsed.input {
+        Some(input) => Ok(input),
+        None => Err(parsed.diagnostics),
+    }
+}
+
+/// The replacement for a word Ruby spells as an operator but this language
+/// does not accept as one.
+///
+/// Refusing `and`/`or`/`not` is a design choice, not an oversight, so the
+/// diagnostic names the operator to write instead.
+fn word_operator_replacement(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "and" => "&&",
+        "or" => "||",
+        "not" => "!",
+        "xor" => "!= on booleans",
+        _ => return None,
+    })
+}
+
+/// Where a keyword that cannot start a REPL input is allowed to appear.
+///
+/// Typing `for k in 1..3 do` at the session prompt is a natural mistake; the
+/// useful answer names the construct it belongs to rather than reporting an
+/// unexpected identifier.
+fn body_only_keyword(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "param" | "node" | "instance" | "model" | "resistor" | "capacitor" | "inductor"
+        | "voltage_source" | "current_source" | "diode" | "for" | "if" => "circuit",
+        "op" | "dc" | "ac" | "tran" | "save" | "measure" => "experiment",
+        "do" | "end" | "else" | "elsif" | "in" => "block",
+        _ => return None,
+    })
+}
+
+/// The `:command` a bare word at the prompt probably meant.
+fn command_word(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "help" => ":help",
+        "load" => ":load",
+        "list" => ":list",
+        "quit" | "exit" => ":quit",
+        "reset" => ":reset",
+        "run" => ":run",
+        _ => return None,
+    })
+}
+
+/// Functions the evaluator implements, so `sqrt 4` can say what is wrong.
+fn is_builtin_function(name: &str) -> bool {
+    matches!(
+        name,
+        "abs" | "sqrt" | "min" | "max" | "str" | "pulse" | "sin" | "pwl" | "v" | "i"
+    )
 }
 
 /// Stand-in for "past the end of the token slice", so that every loop has a
@@ -58,6 +175,9 @@ struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     diagnostics: Diagnostics,
+    /// Set when an error is reported while the cursor is at the end of the
+    /// input, i.e. when the failure could be caused by the text stopping.
+    ran_out: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -66,6 +186,7 @@ impl<'a> Parser<'a> {
             tokens,
             pos: 0,
             diagnostics: Diagnostics::new(),
+            ran_out: false,
         }
     }
 
@@ -168,6 +289,9 @@ impl<'a> Parser<'a> {
     // ---- diagnostics and recovery ---------------------------------------
 
     fn report(&mut self, span: SourceSpan, message: impl Into<String>) {
+        if self.at_eof() {
+            self.ran_out = true;
+        }
         self.diagnostics
             .push(Diagnostic::error(Code::Syntax, message).at(span));
     }
@@ -451,13 +575,36 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => {
-                    let token = self.current().clone();
-                    let message = format!(
-                        "unexpected {}; expected `circuit`, `subcircuit`, or `experiment`",
-                        token.kind.describe()
-                    );
-                    self.report(token.span, message);
-                    self.skip_to_stmt_end();
+                    if self.at_assignment() {
+                        // A session variable is not part of a file: the file
+                        // has `param` for exactly this purpose.
+                        let span = self.span();
+                        let name = self.ident_text().unwrap_or("name").to_string();
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                Code::Syntax,
+                                "assignment is not available in a source file",
+                            )
+                            .at(span)
+                            .with_note(format!(
+                                "declare it as `param :{name}, default: <value>` in a circuit \
+                                 body, or `param :{name}, value: <value>` in an experiment"
+                            ))
+                            .with_note(
+                                "a session variable defined at the REPL is not visible to a \
+                                 circuit",
+                            ),
+                        );
+                        self.skip_to_stmt_end();
+                    } else {
+                        let token = self.current().clone();
+                        let message = format!(
+                            "unexpected {}; expected `circuit`, `subcircuit`, or `experiment`",
+                            token.kind.describe()
+                        );
+                        self.report(token.span, message);
+                        self.skip_to_stmt_end();
+                    }
                 }
             }
             if self.pos == before && !self.at_eof() {
@@ -465,6 +612,151 @@ impl<'a> Parser<'a> {
             }
         }
         program
+    }
+
+    /// Whether the cursor sits on `name =`, i.e. an assignment.
+    fn at_assignment(&self) -> bool {
+        matches!(self.kind(), TokenKind::Ident(_)) && matches!(self.peek_kind(1), TokenKind::Assign)
+    }
+
+    /// Whether the next token could begin an argument, which is how `sqrt 4`
+    /// is told apart from `sqrt` used as a name.
+    fn starts_expression_argument(&self) -> bool {
+        !matches!(
+            self.peek_kind(1),
+            TokenKind::Newline
+                | TokenKind::Eof
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+                | TokenKind::Comma
+                | TokenKind::Dot
+                | TokenKind::DotDot
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::EqEq
+                | TokenKind::BangEq
+                | TokenKind::Lt
+                | TokenKind::Le
+                | TokenKind::Gt
+                | TokenKind::Ge
+                | TokenKind::AmpAmp
+                | TokenKind::PipePipe
+                | TokenKind::Assign
+        )
+    }
+
+    /// One interactive input.
+    fn input(&mut self) -> Input {
+        self.skip_newlines();
+        if self.at_eof() {
+            return Input::Empty;
+        }
+
+        // Definitions are recognised by their keyword, exactly as in a file.
+        if let Some(word) = self.ident_text()
+            && matches!(word, "circuit" | "subcircuit" | "experiment")
+        {
+            return Input::Program(self.program());
+        }
+
+        // `name = expr` — assignment is the session's own statement, and it is
+        // tested before the block-word hint so that `end = 1` is reported as a
+        // bad name rather than as a stray block word.
+        if self.at_assignment() {
+            let name = self.ident_text().unwrap_or_default().to_string();
+            let name_span = self.span();
+            if is_keyword(&name) || is_reserved_name(&name) {
+                self.report(
+                    name_span,
+                    format!("`{name}` is a keyword and cannot name a variable"),
+                );
+                self.bump();
+                self.skip_to_stmt_end();
+                return Input::Empty;
+            }
+            self.bump(); // the name
+            self.bump(); // `=`
+            let Some(value) = self.binary(0) else {
+                return Input::Empty;
+            };
+            self.finish_input();
+            return Input::Assign {
+                name,
+                name_span,
+                value,
+            };
+        }
+
+        // A statement that only makes sense inside a body is a common thing to
+        // type at the prompt; say where it belongs.
+        if let Some(word) = self.ident_text()
+            && let Some(owner) = body_only_keyword(word)
+        {
+            let span = self.span();
+            let note = match owner {
+                "circuit" => "write it inside `circuit :name do ... end` (or define one first)",
+                "experiment" => "write it inside `experiment :name, circuit: :name do ... end`",
+                _ => "it closes or opens a block, which must already be open",
+            };
+            let message = match owner {
+                "circuit" | "experiment" => {
+                    format!("`{word}` is a body statement, not a session input")
+                }
+                _ => format!("`{word}` only belongs inside a block"),
+            };
+            self.diagnostics.push(
+                Diagnostic::error(Code::Syntax, message)
+                    .at(span)
+                    .with_note(note),
+            );
+            self.skip_to_stmt_end();
+            return Input::Empty;
+        }
+
+        // A command word without its colon is a common slip at the prompt.
+        if !self.at_assignment()
+            && let Some(word) = self.ident_text()
+            && let Some(command) = command_word(word)
+        {
+            let span = self.span();
+            self.diagnostics.push(
+                Diagnostic::error(
+                    Code::Syntax,
+                    format!("`{word}` is a command; write `{command}`"),
+                )
+                .at(span)
+                .with_note("commands are not part of the language, so they always start with `:`"),
+            );
+            self.skip_to_stmt_end();
+            return Input::Empty;
+        }
+
+        // Otherwise it is an expression to evaluate.
+        let Some(value) = self.binary(0) else {
+            return Input::Empty;
+        };
+        self.finish_input();
+        Input::Expr(value)
+    }
+
+    /// After a single interactive item, nothing but line breaks may follow.
+    fn finish_input(&mut self) {
+        self.skip_newlines();
+        if self.at_eof() {
+            return;
+        }
+        let token = self.current().clone();
+        self.report(
+            token.span,
+            format!(
+                "unexpected {}; expected the end of the input",
+                token.kind.describe()
+            ),
+        );
+        self.skip_to_stmt_end();
     }
 
     fn circuit(&mut self, is_subcircuit: bool) -> Option<CircuitDef> {
@@ -578,6 +870,22 @@ impl<'a> Parser<'a> {
     // ---- circuit statements ---------------------------------------------
 
     fn circuit_stmt(&mut self) -> Option<Stmt> {
+        if self.at_assignment() {
+            // The same rule as at the top level of a file, and the same fix:
+            // a design parameter is declared with `param`.
+            let span = self.span();
+            let name = self.ident_text().unwrap_or("name").to_string();
+            self.diagnostics.push(
+                Diagnostic::error(Code::Syntax, "assignment is not available in a circuit body")
+                    .at(span)
+                    .with_note(format!(
+                        "declare the parameter with `param :{name}, default: <value>`"
+                    ))
+                    .with_note("a parameter declared here can be overridden per instance, per                                 experiment, or by a sweep"),
+            );
+            self.skip_to_stmt_end();
+            return None;
+        }
         let Some(word) = self.ident_text().map(str::to_string) else {
             let token = self.current().clone();
             let message = format!(
@@ -1063,6 +1371,25 @@ impl<'a> Parser<'a> {
                 })
             }
             other => {
+                if self.at_assignment() {
+                    // Same rule as in a circuit body: an experiment parameter
+                    // is written `param :name, value: ...`, not `name = ...`.
+                    let span = self.span();
+                    let name = self.ident_text().unwrap_or("name").to_string();
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            Code::Syntax,
+                            "assignment is not available in an experiment",
+                        )
+                        .at(span)
+                        .with_note(format!(
+                            "write `param :{name}, value: <value>` to override it for this \
+                             experiment"
+                        )),
+                    );
+                    self.skip_to_stmt_end();
+                    return None;
+                }
                 let token = self.current().clone();
                 let message = format!(
                     "unexpected `{other}`; expected an experiment statement (`op`, `dc`, `ac`, \
@@ -1095,7 +1422,23 @@ impl<'a> Parser<'a> {
     /// operator is left-associative.
     fn binary(&mut self, min_level: u8) -> Option<Expr> {
         let mut lhs = self.unary()?;
-        while let Some((op, level)) = binary_op(self.kind()) {
+        loop {
+            // Ruby's word operators are not part of the language, and saying
+            // so is more useful than "unexpected identifier".
+            if let Some(word) = self.ident_text()
+                && let Some(replacement) = word_operator_replacement(word)
+            {
+                let span = self.span();
+                self.report(
+                    span,
+                    format!("`{word}` is not an operator; write `{replacement}`"),
+                );
+                self.bump();
+                return Some(lhs);
+            }
+            let Some((op, level)) = binary_op(self.kind()) else {
+                break;
+            };
             if level < min_level {
                 break;
             }
@@ -1196,6 +1539,22 @@ impl<'a> Parser<'a> {
                     let message =
                         format!("expected an expression, found `{text}`; this word closes a block");
                     self.error(span, message)
+                } else if let Some(replacement) = word_operator_replacement(&text) {
+                    // `not x` is the one place a word operator starts an
+                    // expression rather than following one.
+                    let span = token.span;
+                    self.error(
+                        span,
+                        format!("`{text}` is not an operator; write `{replacement}`"),
+                    )
+                } else if is_builtin_function(&text) && self.starts_expression_argument() {
+                    // `sqrt 4`: a rule worth stating rather than guessing —
+                    // expressions call with parentheses, statements do not.
+                    let span = token.span;
+                    self.error(
+                        span,
+                        format!("`{text}` is a function; call it as `{text}(...)`"),
+                    )
                 } else {
                     // A bare identifier is a reference, never a call.
                     self.bump();
@@ -2504,6 +2863,161 @@ end
         let diagnostics = parse_errors("circuit :x do\n  node 5\n  bogus :a\nend\n");
         assert!(diagnostics.iter().all(|d| d.code == Code::Syntax));
         assert!(diagnostics.has_errors());
+    }
+
+    // ---- interactive input ----------------------------------------------
+
+    fn input_of(src: &str) -> Input {
+        let tokens = lex(SourceId(0), src).expect("lexes");
+        parse_input(&tokens).unwrap_or_else(|d| {
+            panic!(
+                "should parse:
+{}",
+                d.render_plain()
+            )
+        })
+    }
+
+    fn input_error(src: &str) -> Diagnostics {
+        let tokens = lex(SourceId(0), src).expect("lexes");
+        match parse_input(&tokens) {
+            Ok(input) => panic!("expected an error for {src:?}, got {input:?}"),
+            Err(diagnostics) => diagnostics,
+        }
+    }
+
+    #[test]
+    fn interactive_inputs_are_expressions_assignments_or_definitions() {
+        assert!(matches!(input_of(""), Input::Empty));
+        assert!(matches!(
+            input_of(
+                "
+# nothing
+"
+            ),
+            Input::Empty
+        ));
+        assert!(matches!(input_of("1 + 2"), Input::Expr(_)));
+        assert!(matches!(input_of("v(:out)"), Input::Expr(_)));
+
+        let Input::Assign { name, value, .. } = input_of("r = 1.kohm") else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(name, "r");
+        assert!(matches!(value.kind, ExprKind::Quantity(_)));
+
+        assert!(matches!(
+            input_of(
+                "circuit :d do
+  node :a
+end"
+            ),
+            Input::Program(_)
+        ));
+        assert!(matches!(
+            input_of(
+                "experiment :e, circuit: :d do
+  op
+end"
+            ),
+            Input::Program(_)
+        ));
+    }
+
+    /// The value is evaluated in the session, so an assignment to a word that
+    /// is not a name must be refused rather than stored under that word.
+    #[test]
+    fn assignment_targets_must_be_plain_names() {
+        let diagnostics = input_error("end = 1");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("is a keyword")),
+            "{:?}",
+            messages(&diagnostics)
+        );
+    }
+
+    /// A body statement, a command word and a bare function are the three
+    /// things most often typed at a prompt by mistake; each names its fix.
+    #[test]
+    fn interactive_mistakes_name_their_fix() {
+        expect_input_error("for k in 1..3 do", "is a body statement");
+        expect_input_error("op", "is a body statement");
+        expect_input_error("load x.cdsl", "is a command; write `:load`");
+        expect_input_error("run divider", "is a command; write `:run`");
+        expect_input_error("sqrt 4", "is a function; call it as `sqrt(...)`");
+        expect_input_error("a and b", "`and` is not an operator; write `&&`");
+        expect_input_error("not a", "`not` is not an operator; write `!`");
+    }
+
+    fn expect_input_error(src: &str, needle: &str) {
+        let diagnostics = input_error(src);
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains(needle)),
+            "wanted `{needle}` among {:?}",
+            messages(&diagnostics)
+        );
+    }
+
+    /// The file grammar has no assignment: `name = value` in a circuit is a
+    /// mistake, and the message names the construct that belongs there.
+    #[test]
+    fn assignment_in_a_file_points_at_param() {
+        // At the top level of a file.
+        let diagnostics = parse_errors(
+            "r = 1.kohm
+",
+        );
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("assignment is not available in a source file")),
+            "{:?}",
+            messages(&diagnostics)
+        );
+
+        // Inside a circuit body.
+        let diagnostics = parse_errors(
+            "circuit :d do
+  r = 1.kohm
+end
+",
+        );
+        let found = diagnostics
+            .iter()
+            .find(|d| {
+                d.message
+                    .contains("assignment is not available in a circuit body")
+            })
+            .unwrap_or_else(|| panic!("{:?}", messages(&diagnostics)));
+        assert!(
+            found.notes.iter().any(|n| n.contains("param :r, default:")),
+            "{:?}",
+            found.notes
+        );
+
+        let diagnostics = parse_errors(
+            "circuit :d do
+  node :a
+end
+experiment :e, circuit: :d do
+  r = 1.kohm
+end
+",
+        );
+        let found = diagnostics
+            .iter()
+            .find(|d| {
+                d.message
+                    .contains("assignment is not available in an experiment")
+            })
+            .unwrap_or_else(|| panic!("{:?}", messages(&diagnostics)));
+        assert!(
+            found.notes.iter().any(|n| n.contains("param :r, value:")),
+            "{:?}",
+            found.notes
+        );
     }
 
     #[test]

@@ -5,13 +5,14 @@
 
 ## 0. 工作区
 
-根 `Cargo.toml` 声明 5 个成员 crate：
+根 `Cargo.toml` 声明 6 个成员 crate：
 
 ```
-crates/circuit-core       语义数据结构（无第三方仿真依赖）
-crates/circuit-dsl        lexer / parser / 展开
+crates/circuit-core       语义数据结构、量纲与数值显示（无第三方仿真依赖）
+crates/circuit-dsl        lexer / parser / 展开 / 共享求值器 / 完备性判定
 crates/circuit-backend    后端契约 + Thevenin 适配 + 参数扫描驱动
 crates/circuit-results    结果数据集 / 表达式 / 测量 / 导出
+crates/circuit-session    会话状态与命令 + 实验执行（文件模式与 REPL 共用）
 crates/circuit-cli        cdsl 命令行
 ```
 
@@ -27,7 +28,8 @@ crates/circuit-cli        cdsl 命令行
 | `circuit-dsl` | `circuit-core` | `thiserror` |
 | `circuit-results` | `circuit-core` | `thiserror`, `serde`, `serde_json` |
 | `circuit-backend` | `circuit-core`, `circuit-results` | `cirq-ir`, `thevenin`, `thevenin-types`, `thiserror` |
-| `circuit-cli` | `circuit-core`, `circuit-dsl`, `circuit-backend`, `circuit-results` | `clap`, `serde_json`, `thiserror` |
+| `circuit-session` | `circuit-core`, `circuit-dsl`, `circuit-backend`, `circuit-results` | — |
+| `circuit-cli` | `circuit-core`, `circuit-dsl`, `circuit-backend`, `circuit-results`, `circuit-session` | `clap`, `serde_json`, `thiserror`, `rustyline` |
 
 ## 1. 分层结构
 
@@ -60,10 +62,17 @@ cdsl run 的 stdout 摘要与结果文件
 
 参数扫描是旁路：`cdsl run` 检出 DC 参数扫描后走
 `circuit_backend::sweep::run_parameter_sweep`，每个扫描点重新展开一次，再进入上面
-`Circuit → 后端` 那一段，最后由 `circuit-cli/src/run.rs::stitch` 拼成单个 Dataset
+`Circuit → 后端` 那一段，最后由 `circuit_session::execute` 的 `stitch` 拼成单个 Dataset
 （轴是扫描值）。详见 §7。
 
-**依赖方向**：`core <- results <- backend <- cli`，另有 `core <- dsl <- cli`。
+**依赖方向**：`core <- results <- backend <- session <- cli`，另有 `core <- dsl <- session`。
+
+- `backend <- session`：会话（以及文件模式的 `run`）通过 `circuit_session::execute`
+  驱动后端。执行流程放在这一层而不是 CLI 里，是因为参数扫描要按点重新展开设计，
+  那需要 `circuit-dsl` 的 `Program`——而 `circuit-backend` 不依赖 DSL。
+- `session` **不依赖任何终端库**：`rustyline` 只在 `circuit-cli` 里出现，所以会话
+  逻辑可以直接在测试里驱动（`crates/circuit-session/tests/session.rs`），
+  也便于以后接编辑器。
 
 - `core <- results`：`Dataset`/`Signal` 用 `Dimension` 标注单位，用 `Diagnostic` 报错，
   用 `Limits` 约束结果规模（`crates/circuit-results/src/lib.rs`）。
@@ -101,14 +110,22 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
 
 ### `circuit-dsl`
 
-- **拥有**：`lexer`（含量纲字面量的词法）、`parser`（递归下降，语句关键字按文本分派）、
-  `ast`（语法树，名字是字符串、每个表达式带 span）、`elaborate`
+- **拥有**：`lexer`（含量纲字面量的词法）、`parser`（递归下降，语句关键字按文本分派；
+  `parse` 是文件入口，`parse_input` 是 REPL 的单条输入入口）、`ast`（语法树，名字是
+  字符串、每个表达式带 span）、`eval`（表达式求值器，**唯一**一套值语义，见下）、
+  `complete`（多行输入的三态判定）、`elaborate`
   （名字解析、量纲检查、参数求值、层次展开、循环与条件展开、分析计划构造）。
 - **不拥有**：任何仿真、文件访问或网络访问。整个 crate 是纯函数式的
   （`crates/circuit-dsl/src/lib.rs`）；DSL 不参与仿真过程，展开完成后拓扑固定。
-- **公开入口**：`lex`、`parse`、`compile`（整个文件的全部 circuit 与 experiment）、
-  `elaborate_experiment`（单实验 + 覆盖值，参数扫描每点调用它）、`Elaborated`、
-  `Compiled`、`Program`。`circuit_parameters` 已定义但当前没有任何调用方。
+- **公开入口**：`lex`、`parse`、`parse_input`、`assess`、`compile`（整个文件的全部
+  circuit 与 experiment）、`elaborate_experiment`（单实验 + 覆盖值，参数扫描每点调用它）、
+  `Elaborated`、`Compiled`、`Program`。`circuit_parameters` 已定义但当前没有任何调用方。
+- **共享求值器（`src/eval.rs`）**：`eval::eval(&Expr, &dyn Variables)` 是文件模式与
+  REPL 共用的表达式语义——量纲传播、比较、短路、内置函数、拼接规则都在这里。
+  名字查找走 `Variables` trait：展开器传自己的参数作用域（并借此汇报"参数在此声明"
+  的次要标签），会话传它的变量表。`elaborate.rs` 保留一层同名薄包装，调用点读起来
+  与从前一致，但实现只有一份。这是本轮刻意的结构调整：交互式前端若自带一套求值器，
+  迟早会在"这个程序是什么意思"上跟仿真器分道扬镳。
 
 ### `circuit-backend`
 
@@ -137,13 +154,25 @@ crate 左右；`Circuit` 的字段会混进 solver 句柄，`check --json` 的�
 
 ### `circuit-cli`
 
-- **拥有**：`cdsl` 二进制、三个子命令（`check`、`run`、`capabilities`）、
+- **拥有**：`cdsl` 二进制、四个子命令（`check`、`run`、`repl`、`capabilities`）、
   退出码（0 成功 / 1 用户错误 / 2 内部错误）、"诊断走 stderr、数据与摘要走 stdout"、
-  结果文件命名与"拒绝写回输入文件"（`guard_output`）、`run` 的测量取值顺序。
-- **不拥有**：语言语义、仿真细节、结果格式定义。
-- **产物入口**：`cdsl` 可执行文件（`check` / `run` / `capabilities`）。
+  结果文件命名与"拒绝写回输入文件"（`guard_output`）、终端层（提示符、行编辑、
+  历史、补全，`repl.rs`）。
+- **不拥有**：语言语义、仿真细节、结果格式定义、会话状态与执行流程（都在
+  `circuit-session`）。`run.rs` 现在只负责文件 I/O、写出与摘要打印。
+- **产物入口**：`cdsl` 可执行文件（`check` / `run` / `repl` / `capabilities`）。
   crate 内部的 `check::front_end` 是 `check` 与 `run` 共用的前端入口
-  （读文件 → lex → parse → compile → 后端能力校验）。
+  （读文件 → lex → parse → compile → 后端能力校验），并把解析好的 `Program`
+  一并返回，于是扫描路径不必二次读盘解析。
+
+### `circuit-session`
+
+- **拥有**：会话的定义集合与会话变量、定义替换的原子性规则、`:load` / `:run` /
+  `:list` / `:reset` / `:help` 的行为、REPL 的值显示格式（`format.rs`）、
+  以及实验执行 `execute`（单次 / 参数扫描 / 测量求值 / 结果写出）。
+- **不拥有**：终端交互（在 `circuit-cli/src/repl.rs`），语言语义（在 `circuit-dsl`）。
+- **为什么不放进 CLI**：这样会话行为可以在没有 TTY 的情况下测试，且文件模式与
+  REPL 共用同一条执行路径——两套实现迟早会对同一个实验给出不同答案。
 
 ## 3. Circuit IR
 

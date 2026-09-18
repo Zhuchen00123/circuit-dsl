@@ -59,6 +59,9 @@ pub enum TokenKind {
     DotDot,
     /// `=>`
     FatArrow,
+    /// `=` in an assignment (`r = 1.kohm`). Only the REPL defines session
+    /// variables, so a circuit body reports this with a pointer to `param`.
+    Assign,
 
     // ---- operators ------------------------------------------------------
     Plus,
@@ -100,6 +103,7 @@ impl TokenKind {
                 | TokenKind::Gt
                 | TokenKind::Ge
                 | TokenKind::Colon
+                | TokenKind::Assign
         )
     }
 
@@ -132,6 +136,7 @@ impl TokenKind {
             TokenKind::Dot => ".",
             TokenKind::DotDot => "..",
             TokenKind::FatArrow => "=>",
+            TokenKind::Assign => "=",
             TokenKind::Plus => "+",
             TokenKind::Minus => "-",
             TokenKind::Star => "*",

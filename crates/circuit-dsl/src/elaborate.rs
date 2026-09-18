@@ -37,7 +37,7 @@ use circuit_core::plan::{
     AcSweep, AnalysisKind, AnalysisPlan, AnalysisTask, DcSpec, MeasureKind, MeasureRequest,
     NamedProbe, Probe, Sweep, SweepKind, SweepTarget, TranSpec,
 };
-use circuit_core::span::{SourceId, SourceSpan};
+use circuit_core::span::SourceSpan;
 use circuit_core::units::{
     self, CAPACITANCE, CURRENT, Dimension, FREQUENCY, INDUCTANCE, Quantity, RESISTANCE, TIME,
     VOLTAGE,
@@ -45,9 +45,14 @@ use circuit_core::units::{
 use circuit_core::{AnalysisId, CircuitId, DeviceId, GROUND, Limits, ModelId, NodeId};
 
 use crate::ast::{
-    self, AnalysisCall, Arg, BinaryOp, Call, CircuitDef, DeviceStmtKind, DictEntry, ExpStmt, Expr,
-    ExprKind, ForIter, Program, SpannedName, Stmt, UnaryOp,
+    self, AnalysisCall, Arg, Call, CircuitDef, DeviceStmtKind, ExpStmt, Expr, ExprKind, ForIter,
+    Program, SpannedName, Stmt,
 };
+use crate::eval::{self, Value};
+
+/// The evaluator is shared with the REPL (`crate::eval`); these are the
+/// elaborator's entry points to it, so call sites read as they always did.
+pub use crate::eval::Variables;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -165,64 +170,6 @@ pub fn elaborate_experiment(
 }
 
 // ---------------------------------------------------------------------------
-// Values
-// ---------------------------------------------------------------------------
-
-/// A runtime value during elaboration.
-///
-/// Deliberately small: only what the language can actually compute with.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Value {
-    Num(Quantity),
-    Bool(bool),
-    Sym(String),
-    Str(String),
-    Array(Vec<Value>),
-    Dict(Vec<(String, Value)>),
-}
-
-impl Value {
-    fn type_name(&self) -> &'static str {
-        match self {
-            Value::Num(_) => "number",
-            Value::Bool(_) => "boolean",
-            Value::Sym(_) => "symbol",
-            Value::Str(_) => "string",
-            Value::Array(_) => "array",
-            Value::Dict(_) => "dictionary",
-        }
-    }
-
-    fn as_num(&self) -> Option<Quantity> {
-        match self {
-            Value::Num(q) => Some(*q),
-            _ => None,
-        }
-    }
-
-    fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    fn as_sym(&self) -> Option<&str> {
-        match self {
-            Value::Sym(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
-    fn as_array(&self) -> Option<&[Value]> {
-        match self {
-            Value::Array(a) => Some(a.as_slice()),
-            _ => None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Elaborator
 // ---------------------------------------------------------------------------
 
@@ -271,6 +218,16 @@ impl Scope {
     }
 }
 
+impl eval::Variables for Scope {
+    fn lookup(&self, name: &str) -> Option<Quantity> {
+        self.get(name)
+    }
+
+    fn declared_span(&self, name: &str) -> Option<SourceSpan> {
+        self.spans.get(name).copied()
+    }
+}
+
 struct Elaborator<'a> {
     program: &'a Program,
     limits: Limits,
@@ -289,6 +246,12 @@ struct Elaborator<'a> {
     stack: Vec<String>,
     /// Loop steps executed, against `limits.max_total_steps`.
     steps: u64,
+    /// How many `for`/`if` bodies enclose the statement being run.
+    ///
+    /// A `param` declares a *design* parameter, so it belongs to the circuit
+    /// body and not to elaboration-time control flow; this counter is what
+    /// makes that rule checkable instead of a convention.
+    block_depth: u32,
 }
 
 impl<'a> Elaborator<'a> {
@@ -306,6 +269,7 @@ impl<'a> Elaborator<'a> {
             error_count: 0,
             stack: Vec::new(),
             steps: 0,
+            block_depth: 0,
         }
     }
 
@@ -385,7 +349,53 @@ impl<'a> Elaborator<'a> {
             // as if it were complete.
             return None;
         }
+
+        // The body has run, so which parameters it declares is known exactly.
+        // An override that matches none of them is a typo that would otherwise
+        // change nothing at all — the run would look successful and produce
+        // the default numbers.
+        self.check_overrides_are_declared(def, &scope, overrides);
+        if self.error_count > before {
+            return None;
+        }
+
         self.finish_circuit(&def.name, def.span)
+    }
+
+    /// Report overrides that name a parameter the circuit does not have.
+    ///
+    /// Instance `params:` bindings are checked at the instance; this is the
+    /// same rule for the top-level chain (an experiment's `param`, a sweep
+    /// point, a session's `:run` override).
+    fn check_overrides_are_declared(
+        &mut self,
+        def: &CircuitDef,
+        scope: &Scope,
+        overrides: &[(String, Quantity, SourceSpan)],
+    ) {
+        let mut declared: Vec<&str> = scope.declared.iter().map(String::as_str).collect();
+        declared.sort_unstable();
+        let list = if declared.is_empty() {
+            "<none>".to_string()
+        } else {
+            declared.join(", ")
+        };
+        for (name, _, span) in overrides {
+            if scope.declared.contains(name) {
+                continue;
+            }
+            self.error(
+                Diagnostic::error(
+                    Code::Name,
+                    format!("circuit `{}` has no parameter `{name}`", def.name),
+                )
+                .at(*span)
+                .with_note(format!("declared parameters: {list}"))
+                .with_note(
+                    "an override that names nothing would silently leave every value at its default",
+                ),
+            );
+        }
     }
 
     /// Elaborate the circuit named by an experiment's `circuit:` argument.
@@ -561,6 +571,20 @@ impl<'a> Elaborator<'a> {
     }
 
     fn stmt_param(&mut self, p: &ast::ParamDecl, scope: &mut Scope) {
+        if self.block_depth > 0 {
+            self.error(
+                Diagnostic::error(
+                    Code::Unsupported,
+                    "`param` declares a design parameter, so it belongs in the circuit body",
+                )
+                .at(p.span)
+                .with_note(
+                    "a parameter cannot be declared inside `for` or `if`: move it up, put the condition in the `value:` expression, or write one device statement per branch",
+                ),
+            );
+            return;
+        }
+
         if p.name.expr.is_some() {
             self.error(
                 Diagnostic::error(Code::Type, "a parameter name must be written literally")
@@ -1442,7 +1466,9 @@ impl<'a> Elaborator<'a> {
                     return;
                 }
             }
+            self.block_depth += 1;
             self.run_body(&f.body, scope, ctx);
+            self.block_depth -= 1;
             if self.error_count > 0 {
                 return;
             }
@@ -1460,7 +1486,9 @@ impl<'a> Elaborator<'a> {
             match self.eval(cond, scope) {
                 Ok(v) => match v.as_bool() {
                     Some(true) => {
+                        self.block_depth += 1;
                         self.run_body(body, scope, ctx);
+                        self.block_depth -= 1;
                         return;
                     }
                     Some(false) => continue,
@@ -1483,7 +1511,9 @@ impl<'a> Elaborator<'a> {
             }
         }
         if let Some(body) = &s.else_body {
+            self.block_depth += 1;
             self.run_body(body, scope, ctx);
+            self.block_depth -= 1;
         }
     }
 
@@ -1491,361 +1521,17 @@ impl<'a> Elaborator<'a> {
     // Expression evaluation
     // -----------------------------------------------------------------------
 
-    fn eval(&mut self, e: &Expr, scope: &mut Scope) -> Result<Value, Diagnostic> {
-        match &e.kind {
-            ExprKind::Int(i) => Ok(Value::Num(Quantity::scalar(*i as f64))),
-            ExprKind::Float(f) => Ok(Value::Num(Quantity::scalar(*f))),
-            ExprKind::Quantity(q) => Ok(Value::Num(Quantity::new(q.value, q.dimension))),
-            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
-            ExprKind::Str(s) => Ok(Value::Str(s.clone())),
-            ExprKind::Symbol(s) => Ok(Value::Sym(s.clone())),
-
-            ExprKind::Array(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    out.push(self.eval(item, scope)?);
-                }
-                Ok(Value::Array(out))
-            }
-
-            ExprKind::Dict(entries) => {
-                let mut out = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    out.push((entry.key.clone(), self.eval(&entry.value, scope)?));
-                }
-                Ok(Value::Dict(out))
-            }
-
-            ExprKind::Var(name) => match scope.get(name) {
-                Some(q) => Ok(Value::Num(q)),
-                None => {
-                    let mut d = Diagnostic::error(
-                        Code::Name,
-                        format!("`{name}` is not declared"),
-                    )
-                    .at(e.span)
-                    .with_note(
-                        "an undeclared name is never treated as a node, device or function call",
-                    );
-                    if let Some(src) = scope.spans.get(name) {
-                        d = d.with_secondary(*src, "a parameter with this name is declared here");
-                    }
-                    Err(d)
-                }
-            },
-
-            ExprKind::Unary { op, rhs } => {
-                let v = self.eval(rhs, scope)?;
-                match (op, v) {
-                    (UnaryOp::Neg, Value::Num(q)) => Ok(Value::Num(-q)),
-                    (UnaryOp::Pos, Value::Num(q)) => Ok(Value::Num(q)),
-                    (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnaryOp::Not, other) => Err(Diagnostic::error(
-                        Code::Type,
-                        format!("`!` needs a boolean, found {}", other.type_name()),
-                    )
-                    .at(e.span)),
-                    (_, other) => Err(Diagnostic::error(
-                        Code::Type,
-                        format!("cannot negate {}", other.type_name()),
-                    )
-                    .at(e.span)),
-                }
-            }
-
-            ExprKind::Binary { op, lhs, rhs } => {
-                let a = self.eval(lhs, scope)?;
-                let b = self.eval(rhs, scope)?;
-                self.eval_binary(*op, a, b, e.span, lhs.span, rhs.span)
-            }
-
-            ExprKind::Call(call) => self.eval_call(call, scope),
-        }
-    }
-
-    fn eval_binary(
-        &mut self,
-        op: BinaryOp,
-        a: Value,
-        b: Value,
-        span: SourceSpan,
-        a_span: SourceSpan,
-        b_span: SourceSpan,
-    ) -> Result<Value, Diagnostic> {
-        use BinaryOp::*;
-
-        // `+` also builds names: if either side is text, the result is text.
-        // This is what lets a loop generate `("r" + i)`.
-        if op == Add && (matches!(a, Value::Str(_)) || matches!(b, Value::Str(_))) {
-            let (Some(x), Some(y)) = (stringify(&a), stringify(&b)) else {
-                return Err(Diagnostic::error(
-                    Code::Type,
-                    format!(
-                        "cannot join {} and {} into text",
-                        a.type_name(),
-                        b.type_name()
-                    ),
-                )
-                .at(span));
-            };
-            return Ok(Value::Str(x + &y));
-        }
-
-        if op.is_logical() {
-            let (Some(x), Some(y)) = (a.as_bool(), b.as_bool()) else {
-                return Err(Diagnostic::error(
-                    Code::Type,
-                    format!(
-                        "`{}` needs booleans, found {} and {}",
-                        op.symbol(),
-                        a.type_name(),
-                        b.type_name()
-                    ),
-                )
-                .at(span));
-            };
-            return Ok(Value::Bool(if op == And { x && y } else { x || y }));
-        }
-
-        if op.is_comparison() {
-            // Only a single numeric comparison could be ambiguous; handle the
-            // common Equals/NotEquals for booleans and symbols first.
-            if let (Some(x), Some(y)) = (a.as_bool(), b.as_bool()) {
-                return match op {
-                    Eq => Ok(Value::Bool(x == y)),
-                    Ne => Ok(Value::Bool(x != y)),
-                    _ => Err(Diagnostic::error(
-                        Code::Type,
-                        format!("`{}` cannot compare booleans", op.symbol()),
-                    )
-                    .at(span)),
-                };
-            }
-            if let (Some(x), Some(y)) = (a.as_sym(), b.as_sym()) {
-                return match op {
-                    Eq => Ok(Value::Bool(x == y)),
-                    Ne => Ok(Value::Bool(x != y)),
-                    _ => Err(Diagnostic::error(
-                        Code::Type,
-                        format!("`{}` cannot order symbols", op.symbol()),
-                    )
-                    .at(span)),
-                };
-            }
-            let (Some(x), Some(y)) = (a.as_num(), b.as_num()) else {
-                return Err(Diagnostic::error(
-                    Code::Type,
-                    format!(
-                        "`{}` needs two numbers, found {} and {}",
-                        op.symbol(),
-                        a.type_name(),
-                        b.type_name()
-                    ),
-                )
-                .at(span));
-            };
-            if x.dimension != y.dimension {
-                return Err(Diagnostic::error(
-                    Code::Dimension,
-                    format!("cannot compare {} with {}", x.dimension, y.dimension),
-                )
-                .at(span)
-                .with_secondary(a_span, format!("this is {}", x.dimension))
-                .with_secondary(b_span, format!("this is {}", y.dimension))
-                .with_dims(x.dimension, y.dimension));
-            }
-            let (x, y) = (x.value, y.value);
-            return Ok(Value::Bool(match op {
-                Eq => x == y,
-                Ne => x != y,
-                Lt => x < y,
-                Le => x <= y,
-                Gt => x > y,
-                Ge => x >= y,
-                _ => unreachable!(),
-            }));
-        }
-
-        let (Some(x), Some(y)) = (a.as_num(), b.as_num()) else {
-            return Err(Diagnostic::error(
-                Code::Type,
-                format!(
-                    "`{}` needs two numbers, found {} and {}",
-                    op.symbol(),
-                    a.type_name(),
-                    b.type_name()
-                ),
-            )
-            .at(span));
-        };
-
-        let result = match op {
-            Add | Sub => {
-                if x.dimension != y.dimension {
-                    return Err(Diagnostic::error(
-                        Code::Dimension,
-                        format!("cannot {} {} and {}", op.symbol(), x.dimension, y.dimension),
-                    )
-                    .at(span)
-                    .with_secondary(a_span, format!("this is {}", x.dimension))
-                    .with_secondary(b_span, format!("this is {}", y.dimension))
-                    .with_dims(x.dimension, y.dimension));
-                }
-                Quantity::new(
-                    if op == Add {
-                        x.value + y.value
-                    } else {
-                        x.value - y.value
-                    },
-                    x.dimension,
-                )
-            }
-            Mul => x * y,
-            Div => {
-                if y.value == 0.0 {
-                    return Err(Diagnostic::error(Code::Value, "division by zero").at(b_span));
-                }
-                x / y
-            }
-            _ => unreachable!("logical and comparison handled above"),
-        };
-
-        Ok(Value::Num(result))
-    }
-
-    fn eval_call(&mut self, call: &Call, scope: &mut Scope) -> Result<Value, Diagnostic> {
-        // Built-in numeric functions.
-        match call.name.as_str() {
-            "str" => {
-                if call.positional.len() != 1 || !call.named.is_empty() {
-                    return Err(Diagnostic::error(
-                        Code::Argument,
-                        format!("`str` takes one argument, found {}", call.positional.len()),
-                    )
-                    .at(call.span));
-                }
-                let v = self.eval(&call.positional[0], scope)?;
-                let Some(text) = stringify(&v) else {
-                    return Err(Diagnostic::error(
-                        Code::Type,
-                        format!("`str` cannot convert {}", v.type_name()),
-                    )
-                    .at(call.span));
-                };
-                Ok(Value::Str(text))
-            }
-            "abs" | "sqrt" | "min" | "max" => {
-                let mut nums = Vec::new();
-                for arg in &call.positional {
-                    match self.eval(arg, scope)? {
-                        Value::Num(q) => nums.push(q),
-                        other => {
-                            return Err(Diagnostic::error(
-                                Code::Type,
-                                format!(
-                                    "`{}` takes numbers, found {}",
-                                    call.name,
-                                    other.type_name()
-                                ),
-                            )
-                            .at(arg.span));
-                        }
-                    }
-                }
-                self.builtin_numeric(&call.name, nums, call)
-            }
-            "v" | "i" => Err(Diagnostic::error(
-                Code::Name,
-                format!("`{}` can only be used in `save` and `measure`", call.name),
-            )
-            .at(call.span)
-            .with_note("it names a result signal, not a value available during elaboration")),
-            "pulse" | "sin" | "pwl" => Err(Diagnostic::error(
-                Code::Name,
-                format!("`{}` can only be used as a `waveform:` argument", call.name),
-            )
-            .at(call.span)),
-            other => Err(
-                Diagnostic::error(Code::Name, format!("unknown function `{other}`"))
-                    .at(call.name_span)
-                    .with_note("available: abs, sqrt, min, max, str, pulse, sin, pwl, v, i"),
-            ),
-        }
-    }
-
-    fn builtin_numeric(
-        &mut self,
-        name: &str,
-        args: Vec<Quantity>,
-        call: &Call,
-    ) -> Result<Value, Diagnostic> {
-        let want = |n: usize| -> Result<(), Diagnostic> {
-            if args.len() == n {
-                Ok(())
-            } else {
-                Err(Diagnostic::error(
-                    Code::Argument,
-                    format!("`{name}` takes {n} argument(s), found {}", args.len()),
-                )
-                .at(call.span))
-            }
-        };
-
-        match name {
-            "abs" => {
-                want(1)?;
-                Ok(Value::Num(Quantity::new(
-                    args[0].value.abs(),
-                    args[0].dimension,
-                )))
-            }
-            "sqrt" => {
-                want(1)?;
-                let d = args[0].dimension;
-                // Only an even root of an even-powered dimension is meaningful;
-                // require dimensionless for simplicity and say so.
-                if !d.is_dimensionless() {
-                    return Err(Diagnostic::error(
-                        Code::Dimension,
-                        format!("`sqrt` needs a dimensionless value, found {}", d),
-                    )
-                    .at(call.span)
-                    .with_dims(units::DIMENSIONLESS, d));
-                }
-                if args[0].value < 0.0 {
-                    return Err(
-                        Diagnostic::error(Code::Value, "`sqrt` of a negative number").at(call.span),
-                    );
-                }
-                Ok(Value::Num(Quantity::scalar(args[0].value.sqrt())))
-            }
-            "min" | "max" => {
-                want(2)?;
-                if args[0].dimension != args[1].dimension {
-                    return Err(Diagnostic::error(
-                        Code::Dimension,
-                        format!(
-                            "`{name}` needs two values of the same kind, found {} and {}",
-                            args[0].dimension, args[1].dimension
-                        ),
-                    )
-                    .at(call.span)
-                    .with_dims(args[0].dimension, args[1].dimension));
-                }
-                let pick = if name == "min" {
-                    args[0].value.min(args[1].value)
-                } else {
-                    args[0].value.max(args[1].value)
-                };
-                Ok(Value::Num(Quantity::new(pick, args[0].dimension)))
-            }
-            _ => unreachable!("caller filters the name"),
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Argument helpers
     // -----------------------------------------------------------------------
+
+    /// Evaluate an expression with this elaborator's parameter scope.
+    ///
+    /// The implementation lives in `crate::eval` so the REPL evaluates the
+    /// same language; this wrapper keeps the existing call sites readable.
+    fn eval(&mut self, e: &Expr, scope: &mut Scope) -> Result<Value, Diagnostic> {
+        eval::eval(e, scope)
+    }
 
     /// Evaluate a numeric argument and require an exact dimension.
     fn num_arg(
@@ -3107,26 +2793,6 @@ fn check_identifier(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Turn a value into text, for string concatenation.
-fn stringify(v: &Value) -> Option<String> {
-    Some(match v {
-        Value::Str(s) => s.clone(),
-        Value::Sym(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        Value::Num(q) => {
-            if !q.dimension.is_dimensionless() {
-                return None;
-            }
-            if q.value.fract() == 0.0 && q.value.abs() < 1e15 {
-                format!("{}", q.value as i64)
-            } else {
-                format!("{}", q.value)
-            }
-        }
-        _ => return None,
-    })
-}
-
 /// Look a node up by its local name or its full hierarchical name.
 fn node_lookup(circuit: &Circuit, name: &str) -> Option<NodeId> {
     if name == "gnd" || name == "0" {
@@ -3186,14 +2852,3 @@ impl Arg {
         }
     }
 }
-
-impl Value {
-    /// Convenience for tests: extract a numeric value.
-    pub fn num(&self) -> Option<Quantity> {
-        self.as_num()
-    }
-}
-
-/// Unused parameter kept for signature symmetry with future needs.
-#[allow(dead_code)]
-fn _unused(_: SourceId, _: DictEntry, _: SpannedName) {}

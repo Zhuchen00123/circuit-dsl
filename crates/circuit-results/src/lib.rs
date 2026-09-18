@@ -64,27 +64,10 @@ pub use export::{
 pub use expr::{Expr, Value, eval};
 pub use measure::{Measured, Measurement, measure, measure_signal, reduce};
 
-/// Format a finite number for a CSV field or a measurement summary.
-///
-/// Rust's `Display` for `f64` never uses exponent notation, so `1e-300` would
-/// become a 300-character field. Values whose plain form exceeds
-/// [`MAX_PLAIN_DIGITS`] are written in exponent form instead; both forms parse
-/// back to the same `f64`, so nothing is lost.
-///
-/// Non-finite values are returned as `NaN`/`inf` text: the exporters check
-/// [`f64::is_finite`] before calling this and emit an empty field instead.
-pub fn format_number(value: f64) -> String {
-    let plain = format!("{value}");
-    if plain.len() <= MAX_PLAIN_DIGITS {
-        plain
-    } else {
-        format!("{value:e}")
-    }
-}
-
-/// Longest plain decimal form [`format_number`] will emit before switching to
-/// exponent notation.
-pub const MAX_PLAIN_DIGITS: usize = 32;
+/// Number formatting lives in `circuit-core` so the REPL, the CSV writer and
+/// the measurement summaries cannot drift apart. Re-exported here because this
+/// is where callers have always found it.
+pub use circuit_core::{MAX_PLAIN_DIGITS, format_number};
 
 #[cfg(test)]
 mod tests {
