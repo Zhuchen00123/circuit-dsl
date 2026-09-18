@@ -1,0 +1,8 @@
+# Rust build output. `_probe` is excluded from the workspace but has its own
+# target directory, so it needs its own entry.
+/target
+_probe/target
+
+# Editor and tooling leftovers.
+*.rs.bk
+*.pdb

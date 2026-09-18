@@ -1,0 +1,11 @@
+[package]
+name = "circuit-dsl"
+description = "Lexer, parser, semantic analysis and elaboration for the circuit DSL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+circuit-core.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/circuit-core",
+    "crates/circuit-dsl",
+    "crates/circuit-backend",
+    "crates/circuit-results",
+    "crates/circuit-cli",
+]
+# `_probe` is the standalone Phase-0 backend evaluation harness. It is kept in
+# the tree as reproducible evidence (see docs/backend-evaluation.md) but is not
+# part of the product workspace.
+exclude = ["_probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+repository = "https://example.invalid/circuit-dsl"
+
+[workspace.dependencies]
+circuit-core = { path = "crates/circuit-core" }
+circuit-dsl = { path = "crates/circuit-dsl" }
+circuit-backend = { path = "crates/circuit-backend" }
+circuit-results = { path = "crates/circuit-results" }
+
+# Third-party
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Simulation backend (see docs/backend-evaluation.md)
+cirq-ir = "0.5.0"
+thevenin = "0.5.0"
+thevenin-types = "0.5.0"
+
+[profile.release]
+opt-level = 3

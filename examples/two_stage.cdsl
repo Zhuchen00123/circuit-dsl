@@ -1,0 +1,69 @@
+# Language composition: parameters, subcircuits, hierarchy, a loop and a
+# conditional all in one design.
+#
+#     cdsl run examples/two_stage.cdsl --experiment response
+#
+# Two instances of the same subcircuit get independent nodes and independent
+# parameter values. The loop builds a chain of load resistors with distinct
+# names, and the conditional picks one topology or the other at elaboration
+# time, so the simulated circuit is fully determined before the solver runs.
+
+subcircuit :lowpass, ports: [:input, :output, :ground] do
+  param :r, default: 1.kohm
+  param :c, default: 100.nF
+
+  # An internal node belongs to this instance only; two instances never share
+  # it, which is why they get separate names like `stage1.internal`.
+  node :internal
+
+  resistor :r1, p: :input, n: :internal, value: r
+  resistor :r2, p: :internal, n: :output, value: r
+  capacitor :c1, p: :output, n: :ground, value: c
+end
+
+circuit :two_stage do
+  param :rstage, default: 1.kohm
+  param :cstage, default: 100.nF
+  param :taps,    default: 3
+
+  node :vin, :mid, :out, :load
+
+  voltage_source :src, p: :vin, n: :gnd, dc: 0.V, ac: 1.V
+
+  instance :stage1, of: :lowpass,
+    ports: { input: :vin, output: :mid, ground: :gnd },
+    params: { r: rstage, c: cstage }
+
+  instance :stage2, of: :lowpass,
+    ports: { input: :mid, output: :out, ground: :gnd }
+
+  # A bank of load resistors built by a loop. The name is computed from the
+  # loop variable, so every iteration declares a distinct device; a fixed name
+  # would be rejected as a duplicate.
+  for k in 1..taps do
+    resistor ("rl" + k), p: :out, n: :load, value: k * 10.kohm
+  end
+
+  if taps > 2 do
+    capacitor :cload, p: :load, n: :gnd, value: 10.pF
+  else
+    capacitor :cload, p: :load, n: :gnd, value: 1.pF
+  end
+end
+
+experiment :response, circuit: :two_stage do
+  ac from: 10.Hz, to: 10.MHz, points_per_decade: 20
+  save v(:vin), v(:mid), v(:out)
+end
+
+# An internal node of an instance is reached by its full path. The name is the
+# one the elaborator prints and the one the CSV uses anyway: `stage1.r1` is the
+# `r1` of the first instance, and `stage2.r1` is a different device.
+#
+# Each stage ends in a capacitor, so below the corner almost no current flows
+# and every node sits at the input. The interesting rows are near and above the
+# corner, where the second stage loads the first and the currents separate.
+experiment :inside, circuit: :two_stage do
+  ac from: 10.Hz, to: 10.MHz, points_per_decade: 2
+  save v(:vin), v(:stage1.internal), v(:stage2.internal), i(:stage1.r1), i(:stage2.r1)
+end

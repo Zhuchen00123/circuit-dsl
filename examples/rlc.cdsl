@@ -1,0 +1,48 @@
+# Series RLC, output taken across the capacitor.
+#
+#   H(jw) = 1 / (1 - w^2*L*C + j*w*R*C)
+#   f0    = 1 / (2*pi*sqrt(L*C)) = 5.033 kHz
+#   Q     = (1/R) * sqrt(L/C)   = 1.0
+#
+# At resonance the capacitor voltage peaks above the source amplitude; the AC
+# sweep below covers a decade either side of f0 so the peak is resolved.
+
+circuit :rlc do
+  node :vin, :mid, :vout
+
+  voltage_source :src, p: :vin, n: :gnd, dc: 0.V, ac: 1.V
+
+  resistor :r1, p: :vin, n: :mid, value: 100.ohm
+  inductor :l1, p: :mid, n: :vout, value: 10.mH
+  capacitor :c1, p: :vout, n: :gnd, value: 100.nF
+end
+
+experiment :frequency_response, circuit: :rlc do
+  ac from: 100.Hz, to: 100.kHz, points_per_decade: 40
+  save v(:vin), v(:vout), i(:r1)
+end
+
+# The same circuit as a transient: a square wave near resonance, which shows
+# the ringing the AC sweep only implies.
+
+circuit :rlc_driven do
+  node :vin, :mid, :vout
+
+  voltage_source :src, p: :vin, n: :gnd,
+    dc: 0.V,
+    waveform: pulse(low: -1.V, high: 1.V,
+                    delay: 0.s, rise: 10.ns,
+                    fall: 10.ns, width: 99.us,
+                    period: 200.us)
+
+  resistor :r1, p: :vin, n: :mid, value: 100.ohm
+  inductor :l1, p: :mid, n: :vout, value: 10.mH
+  capacitor :c1, p: :vout, n: :gnd, value: 100.nF
+end
+
+experiment :ringing, circuit: :rlc_driven do
+  tran stop: 600.us, max_step: 200.ns
+  save v(:vin), v(:vout)
+  measure :peak, max: v(:vout)
+  measure :trough, min: v(:vout)
+end

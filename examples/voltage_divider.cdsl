@@ -1,0 +1,26 @@
+# Resistive divider.
+#
+# Running this with
+#
+#     cdsl run examples/voltage_divider.cdsl --experiment divider
+#
+# must give v(out) = 3.000 V and i(r1) = +2.000 mA.
+#
+# The sign is worth reading carefully: v1 sits between `in` and `gnd`, so the
+# current through it in the p -> n direction is negative (-1 mA), because it
+# delivers power. The current through r1, which absorbs it, is positive.
+
+circuit :divider do
+  node :in, :out
+
+  # `p` and `n` fix the positive current direction: r1's current is measured
+  # from `in` to `out`.
+  voltage_source :v1, p: :in, n: :gnd, dc: 5.V
+  resistor :r1, p: :in, n: :out, value: 1.kohm
+  resistor :r2, p: :out, n: :gnd, value: 1.5.kohm
+end
+
+experiment :divider, circuit: :divider do
+  op
+  save v(:in), v(:out), i(:r1), i(:v1)
+end

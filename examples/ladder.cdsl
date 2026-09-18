@@ -1,0 +1,59 @@
+# A topology whose nodes are named by a loop.
+#
+#     cdsl run examples/ladder.cdsl --experiment tap --out out
+#
+# The rungs of this ladder are built from computed names: iteration `k` declares
+# the node `midk` and wires the resistors that meet there. Writing it by hand
+# would mean repeating the same three lines per rung, and editing the tap count
+# would mean editing every one of them.
+#
+# `taps` is a parameter, so the width of the ladder follows the design rather
+# than the source text: change it and the loop declares a different number of
+# nodes. The probes name those nodes the same way and are resolved after
+# elaboration, so `v(:midk)` columns appear and disappear with `taps`.
+
+circuit :ladder do
+  param :taps, default: 4
+  param :rung, default: 1.kohm
+  param :shunt, default: 2.kohm
+  param :supply, default: 3.V
+
+  node :top, :bot
+
+  # Declare every rung before anything connects to it: a body is read in order,
+  # and a terminal naming a node that does not exist yet is an error.
+  for k in 1..taps do
+    node ("mid" + k)
+  end
+
+  voltage_source :src, p: :top, n: :gnd, dc: supply
+
+  # The chain: top - r0 - mid1 - r1 - mid2 - ... - midN - rtN - bot - rbot.
+  resistor :r0, p: :top, n: ("mid" + 1), value: rung
+  for k in 1..(taps - 1) do
+    resistor ("r" + k), p: ("mid" + k), n: ("mid" + (k + 1)), value: rung
+  end
+  resistor ("rt" + taps), p: ("mid" + taps), n: :bot, value: rung
+
+  # One shunt per tap, and the leg that returns the bottom of the chain to
+  # ground. Without it the chain would carry no current and every tap would sit
+  # at the supply voltage.
+  for k in 1..taps do
+    resistor ("rs" + k), p: ("mid" + k), n: :gnd, value: shunt
+  end
+  resistor :rbot, p: :bot, n: :gnd, value: rung
+end
+
+experiment :tap, circuit: :ladder do
+  op
+  save v(:top), v(:mid1), v(:mid2), v(:mid3), v(:mid4), i(:r0), i(:rs1)
+end
+
+# The same circuit at two rungs. `taps` is a parameter, so this experiment
+# elaborates a two-rung ladder: `mid3` and `mid4` do not exist here, and a probe
+# naming them would be an error rather than an empty column.
+experiment :two_rungs, circuit: :ladder do
+  param :taps, value: 2
+  op
+  save v(:mid1), v(:mid2), i(:rs1), i(:rs2)
+end

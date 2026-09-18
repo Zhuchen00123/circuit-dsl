@@ -1,0 +1,38 @@
+# RC low-pass: the worked example from the language specification.
+#
+#   op    steady state before the step
+#   ac    H(jw) = 1 / (1 + jwRC), corner at 1/(2*pi*R*C) = 1.5915 kHz
+#   tran  step response v(t) = 1 - exp(-t/tau), tau = R*C = 100 us
+#
+# Note that `max_step` bounds the solver's *internal* step. The time axis that
+# comes back is solver-chosen and is not uniformly spaced, which is why `avg`
+# and `rms` integrate over time rather than averaging samples.
+
+circuit :rc_filter do
+  param :r, default: 1.kohm
+  param :c, default: 100.nF
+
+  node :vin, :vout
+
+  voltage_source :input, p: :vin, n: :gnd,
+    dc: 0.V,
+    ac: 1.V,
+    waveform: pulse(low: 0.V, high: 1.V,
+                    delay: 0.s, rise: 1.ns,
+                    fall: 1.ns, width: 5.ms,
+                    period: 10.ms)
+
+  resistor :r1, p: :vin, n: :vout, value: r
+  capacitor :c1, p: :vout, n: :gnd, value: c
+end
+
+experiment :response, circuit: :rc_filter do
+  op
+  ac from: 10.Hz, to: 10.MHz, points_per_decade: 20
+  tran stop: 500.us, max_step: 500.ns
+
+  save v(:vin), v(:vout), i(:input), i(:r1)
+  measure :vfinal, max: v(:vout)
+  measure :vavg, avg: v(:vout)
+  measure :vrms, rms: v(:vout)
+end

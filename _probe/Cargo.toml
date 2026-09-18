@@ -1,0 +1,11 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cirq-ir = "0.5.0"
+num-complex = "0.4.6"
+thevenin = "0.5.0"
+thevenin-cirq = "0.5.0"
+thevenin-types = "0.5.0"

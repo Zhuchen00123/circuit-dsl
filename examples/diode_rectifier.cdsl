@@ -1,0 +1,52 @@
+# Half-wave rectifier with a smoothing capacitor.
+#
+# The diode makes this a nonlinear circuit, so the operating point is found by
+# Newton iteration rather than a single linear solve. `docs/backend-evaluation.md`
+# records the independent check: with a 1k load the diode drop comes out at
+# 0.692872 V against 0.692868 V from a bisection solution of the Shockley
+# equation.
+#
+# A model parameter carrying a unit is written with one, e.g. `is: 1e-14.A`.
+# The language does not silently read a bare number as amps.
+
+circuit :half_wave do
+  model :dmod, type: :diode, is: 1e-14.A, n: 1
+
+  node :vin, :vout
+
+  voltage_source :src, p: :vin, n: :gnd,
+    dc: 0.V,
+    waveform: sin(offset: 0.V, amplitude: 5.V, frequency: 1.kHz)
+
+  diode :d1, p: :vin, n: :vout, model: :dmod
+  resistor :load, p: :vout, n: :gnd, value: 1.kohm
+end
+
+experiment :rectified, circuit: :half_wave do
+  tran stop: 3.ms, max_step: 5.us
+  save v(:vin), v(:vout)
+  measure :vpeak, max: v(:vout)
+  measure :vavg, avg: v(:vout)
+end
+
+# The same diode at DC, where the operating point is easy to compare against a
+# hand calculation: 5 V through 1k into a diode to ground.
+
+circuit :diode_dc do
+  model :dmod, type: :diode, is: 1e-14.A, n: 1
+
+  node :vin, :vout
+
+  voltage_source :src, p: :vin, n: :gnd, dc: 5.V
+  resistor :r1, p: :vin, n: :vout, value: 1.kohm
+  diode :d1, p: :vout, n: :gnd, model: :dmod
+end
+
+experiment :forward_drop, circuit: :diode_dc do
+  op
+  save v(:vin), v(:vout), i(:r1)
+
+  # Sweep the supply and watch the drop barely move: that is the exponential
+  # law doing its job.
+  dc source: :src, from: 0.V, to: 5.V, step: 0.5.V
+end

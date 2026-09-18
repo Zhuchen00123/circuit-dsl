@@ -1,0 +1,13 @@
+[package]
+name = "circuit-results"
+description = "Result datasets, expressions, measurements and export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+circuit-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

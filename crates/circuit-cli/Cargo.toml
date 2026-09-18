@@ -1,0 +1,20 @@
+[package]
+name = "circuit-cli"
+description = "Command line interface for the circuit DSL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cdsl"
+path = "src/main.rs"
+
+[dependencies]
+circuit-core.workspace = true
+circuit-dsl.workspace = true
+circuit-backend.workspace = true
+circuit-results.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+serde_json.workspace = true

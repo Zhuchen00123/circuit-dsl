@@ -1,0 +1,26 @@
+# Sweeping a parameter rather than a source value.
+#
+# The engine can vary a source's value itself, but a parameter such as `r`
+# changes a device value, so the design is re-elaborated once per point. The
+# sweep driver checks after every point that the topology is unchanged: if the
+# parameter ever added, removed or rewired a device, the sweep would be
+# rejected rather than silently producing an incomparable set of results.
+#
+#     cdsl run examples/parameter_sweep.cdsl --experiment sweep
+#
+# Expect v(out) to fall as r rises, following 1.5/(r + 1.5).
+
+circuit :loaded_divider do
+  param :r, default: 1.kohm
+
+  node :in, :out
+
+  voltage_source :src, p: :in, n: :gnd, dc: 3.V
+  resistor :r1, p: :in, n: :out, value: r
+  resistor :r2, p: :out, n: :gnd, value: 1.5.kohm
+end
+
+experiment :sweep, circuit: :loaded_divider do
+  dc param: :r, from: 0.5.kohm, to: 4.kohm, step: 0.5.kohm
+  save v(:out), i(:r1)
+end

@@ -1,0 +1,17 @@
+[package]
+name = "circuit-backend"
+description = "Simulation backend contract and the Thevenin adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+circuit-core.workspace = true
+circuit-results.workspace = true
+thiserror.workspace = true
+
+# Backend selection and the evidence behind it: docs/backend-evaluation.md
+cirq-ir.workspace = true
+thevenin.workspace = true
+thevenin-types.workspace = true
